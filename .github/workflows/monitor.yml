@@ -1,0 +1,53 @@
+name: Portfolio Monitor
+
+on:
+  # Automatic schedule during market hours
+  schedule:
+    # Runs at 9:30 AM, 11:00 AM, 1:00 PM, 3:00 PM IST (Mon-Fri)
+    - cron: '0 4 * * 1-5'     # 9:30 AM IST
+    - cron: '30 5 * * 1-5'    # 11:00 AM IST
+    - cron: '30 7 * * 1-5'    # 1:00 PM IST
+    - cron: '30 9 * * 1-5'    # 3:00 PM IST
+    - cron: '0 10 * * 1-5'    # 3:30 PM IST (market close)
+  
+  # Manual trigger button
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Run even if market closed'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run Monitor
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          if [ "${{ github.event.inputs.force_run }}" = "true" ]; then
+            python portfolio_monitor.py --force
+          else
+            python portfolio_monitor.py
+          fi
