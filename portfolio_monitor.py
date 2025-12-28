@@ -1,12 +1,15 @@
 """
 ================================================================================
-PORTFOLIO MONITOR v3.0 - GITHUB ACTIONS EDITION
+SMART PORTFOLIO MONITOR v4.0 - PREDICTIVE EDITION
 ================================================================================
-Designed for GitHub Actions:
-- Runs on schedule (cron)
-- Sends email alerts and daily summary
-- Reads portfolio from Excel in repo
-- No web server needed
+Features:
+- Early exit signals BEFORE stop loss hits
+- Hold recommendations after target
+- Dynamic target adjustment
+- Multi-timeframe analysis
+- Volume confirmation
+- Support/Resistance detection
+- Momentum scoring
 ================================================================================
 """
 
@@ -15,7 +18,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import os
-import sys
 import json
 import smtplib
 from email.mime.text import MIMEText
@@ -28,31 +30,25 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION
 # ============================================================================
 
-# Get from environment variables (GitHub Secrets)
 CONFIG = {
-    # Email settings from GitHub Secrets
+    # Email settings from environment
     "sender_email": os.environ.get("SENDER_EMAIL", ""),
     "sender_password": os.environ.get("SENDER_PASSWORD", ""),
     "recipient_email": os.environ.get("RECIPIENT_EMAIL", ""),
     "smtp_server": os.environ.get("SMTP_SERVER", "smtp.gmail.com"),
     "smtp_port": int(os.environ.get("SMTP_PORT", "587")),
     
-    # File paths
+    # Files
     "excel_file": "my_portfolio.xlsx",
-    "alert_history_file": "alert_history.json",
     
-    # Market hours (IST)
+    # Market hours
     "market_open": "09:15",
     "market_close": "15:30",
     
-    # Alert thresholds
-    "alert_on_loss_percent": -2.0,
-    "alert_on_profit_percent": 5.0,
-    "trailing_sl_trigger": 3.0,
-    "trend_reversal_sensitivity": 0.7,
-    
-    # Email cooldown (minutes)
-    "email_cooldown_minutes": 60,
+    # Smart analysis settings
+    "early_exit_threshold": 0.7,      # Exit if 70% likely to hit SL
+    "hold_after_target_threshold": 0.6,  # Hold if 60% chance of more upside
+    "volume_confirmation_multiplier": 1.3,  # Need 1.3x avg volume
 }
 
 # ============================================================================
@@ -60,357 +56,19 @@ CONFIG = {
 # ============================================================================
 
 def log(message, level="INFO"):
-    """Log message with timestamp"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}")
 
 def get_ist_now():
-    """Get current IST time"""
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 def is_market_hours():
-    """Check if market is open"""
     ist_now = get_ist_now()
-    
-    # Skip weekends
     if ist_now.weekday() >= 5:
         return False
-    
     market_open = datetime.strptime(CONFIG['market_open'], "%H:%M").time()
     market_close = datetime.strptime(CONFIG['market_close'], "%H:%M").time()
-    
     return market_open <= ist_now.time() <= market_close
-
-def get_market_status():
-    """Get market status details"""
-    ist_now = get_ist_now()
-    
-    if ist_now.weekday() >= 5:
-        return {'is_open': False, 'status': 'WEEKEND', 'message': 'Markets closed for weekend'}
-    
-    market_open = datetime.strptime(CONFIG['market_open'], "%H:%M").time()
-    market_close = datetime.strptime(CONFIG['market_close'], "%H:%M").time()
-    current_time = ist_now.time()
-    
-    if current_time < market_open:
-        return {'is_open': False, 'status': 'PRE-MARKET', 'message': f'Opens at {CONFIG["market_open"]} IST'}
-    elif current_time > market_close:
-        return {'is_open': False, 'status': 'CLOSED', 'message': 'Market closed for today'}
-    else:
-        return {'is_open': True, 'status': 'OPEN', 'message': f'Closes at {CONFIG["market_close"]} IST'}
-
-def load_alert_history():
-    """Load alert history from JSON file"""
-    try:
-        if os.path.exists(CONFIG['alert_history_file']):
-            with open(CONFIG['alert_history_file'], 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        log(f"Error loading alert history: {e}", "WARNING")
-    return {'cooldowns': {}, 'history': []}
-
-def save_alert_history(data):
-    """Save alert history to JSON file"""
-    try:
-        with open(CONFIG['alert_history_file'], 'w') as f:
-            json.dump(data, f, indent=2, default=str)
-    except Exception as e:
-        log(f"Error saving alert history: {e}", "ERROR")
-
-def can_send_alert(ticker, alert_type, history):
-    """Check if alert can be sent (cooldown check)"""
-    key = f"{ticker}_{alert_type}"
-    cooldown = timedelta(minutes=CONFIG['email_cooldown_minutes'])
-    cooldowns = history.get('cooldowns', {})
-    
-    if key in cooldowns:
-        try:
-            last_time = datetime.fromisoformat(cooldowns[key])
-            if datetime.now() - last_time < cooldown:
-                return False
-        except:
-            pass
-    
-    cooldowns[key] = datetime.now().isoformat()
-    history['cooldowns'] = cooldowns
-    return True
-
-# ============================================================================
-# EMAIL FUNCTIONS
-# ============================================================================
-
-def send_email(subject, html_content):
-    """Send email"""
-    if not CONFIG['sender_email'] or not CONFIG['sender_password']:
-        log("Email credentials not configured. Skipping email.", "WARNING")
-        return False
-    
-    try:
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = subject
-        msg['From'] = CONFIG['sender_email']
-        msg['To'] = CONFIG['recipient_email']
-        msg.attach(MIMEText(html_content, 'html'))
-        
-        server = smtplib.SMTP(CONFIG['smtp_server'], CONFIG['smtp_port'])
-        server.starttls()
-        server.login(CONFIG['sender_email'], CONFIG['sender_password'])
-        server.sendmail(CONFIG['sender_email'], CONFIG['recipient_email'], msg.as_string())
-        server.quit()
-        
-        log(f"Email sent: {subject}")
-        return True
-    except Exception as e:
-        log(f"Email error: {e}", "ERROR")
-        return False
-
-def send_alert_email(result, alert):
-    """Send individual alert email"""
-    r = result
-    pnl_color = '#28a745' if r['pnl_percent'] >= 0 else '#dc3545'
-    priority_colors = {'CRITICAL': '#dc3545', 'HIGH': '#fd7e14', 'MEDIUM': '#ffc107'}
-    priority_color = priority_colors.get(alert['priority'], '#6c757d')
-    ist_now = get_ist_now()
-    
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f5f5f5;">
-    <div style="background: white; border-radius: 15px; padding: 25px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-        
-        <!-- Header -->
-        <div style="background: {priority_color}; color: white; padding: 25px; border-radius: 10px; text-align: center; margin-bottom: 20px;">
-            <h2 style="margin: 0; font-size: 18px;">[{alert['priority']}] {alert['type']}</h2>
-            <h1 style="margin: 10px 0 0 0; font-size: 32px;">{r['ticker']}</h1>
-        </div>
-        
-        <!-- Position Details -->
-        <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-            <h3 style="margin: 0 0 15px 0; color: #333;">Position Details</h3>
-            <table style="width: 100%; border-collapse: collapse;">
-                <tr>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee;">Position Type</td>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee; text-align: right; font-weight: bold;">
-                        <span style="background: {'#28a745' if r['position_type'] == 'LONG' else '#dc3545'}; color: white; padding: 3px 10px; border-radius: 3px;">
-                            {r['position_type']}
-                        </span>
-                    </td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee;">Entry Price</td>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee; text-align: right; font-weight: bold;">Rs. {r['entry_price']:,.2f}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee;">Current Price</td>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee; text-align: right; font-weight: bold;">Rs. {r['current_price']:,.2f}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee;">P&L</td>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee; text-align: right; font-weight: bold; color: {pnl_color};">
-                        {r['pnl_percent']:+.2f}% (Rs. {r['pnl_amount']:+,.2f})
-                    </td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee;">Stop Loss</td>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee; text-align: right; font-weight: bold;">Rs. {r['stop_loss']:,.2f}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee;">Target 1</td>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee; text-align: right; font-weight: bold;">Rs. {r['target1']:,.2f}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0;">Quantity</td>
-                    <td style="padding: 8px 0; text-align: right; font-weight: bold;">{r['quantity']}</td>
-                </tr>
-            </table>
-        </div>
-        
-        <!-- Technical Indicators -->
-        <div style="background: #f8f9fa; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-            <h3 style="margin: 0 0 15px 0; color: #333;">Technical Indicators</h3>
-            <table style="width: 100%; border-collapse: collapse;">
-                <tr>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee;">RSI (14)</td>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee; text-align: right; font-weight: bold;">{r['rsi']:.1f}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee;">Trend</td>
-                    <td style="padding: 8px 0; border-bottom: 1px solid #eee; text-align: right; font-weight: bold; color: {'#28a745' if r['trend'] == 'BULLISH' else '#dc3545'};">
-                        {r['trend']} ({r['trend_strength']:.0f}%)
-                    </td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0;">MACD Histogram</td>
-                    <td style="padding: 8px 0; text-align: right; font-weight: bold;">{r['macd_histogram']:.2f}</td>
-                </tr>
-            </table>
-        </div>
-        
-        <!-- Alert Message -->
-        <div style="background: #fff3cd; padding: 15px; border-radius: 10px; border-left: 4px solid #ffc107; margin-bottom: 20px;">
-            <strong>Alert:</strong> {alert['message']}
-        </div>
-        
-        <!-- Action Box -->
-        <div style="background: #007bff; color: white; padding: 25px; border-radius: 10px; text-align: center;">
-            <h3 style="margin: 0; font-size: 14px;">RECOMMENDED ACTION</h3>
-            <p style="margin: 10px 0 0 0; font-size: 20px; font-weight: bold;">{alert['action']}</p>
-        </div>
-        
-        <!-- Footer -->
-        <p style="text-align: center; color: #999; font-size: 12px; margin-top: 20px;">
-            Portfolio Monitor | {ist_now.strftime('%Y-%m-%d %H:%M:%S')} IST<br>
-            Powered by GitHub Actions
-        </p>
-    </div>
-</body>
-</html>
-    """
-    
-    return send_email(f"[{alert['priority']}] {r['ticker']}: {alert['type']}", html)
-
-def send_summary_email(results, market):
-    """Send portfolio summary email"""
-    ist_now = get_ist_now()
-    total_pnl = sum(r['pnl_amount'] for r in results) if results else 0
-    total_pnl_color = '#28a745' if total_pnl >= 0 else '#dc3545'
-    total_alerts = sum(len(r.get('alerts', [])) for r in results)
-    
-    # Build positions table
-    positions_html = ""
-    for r in results:
-        pnl_color = '#28a745' if r['pnl_percent'] >= 0 else '#dc3545'
-        status_color = '#dc3545' if r['status'] == 'CRITICAL' else '#ffc107' if r['status'] in ['WARNING', 'INFO'] else '#28a745'
-        pos_color = '#28a745' if r['position_type'] == 'LONG' else '#dc3545'
-        
-        positions_html += f"""
-        <tr>
-            <td style="padding: 12px 8px; border-bottom: 1px solid #eee;"><strong>{r['ticker']}</strong></td>
-            <td style="padding: 12px 8px; border-bottom: 1px solid #eee;">
-                <span style="background: {pos_color}; color: white; padding: 2px 8px; border-radius: 3px; font-size: 12px;">
-                    {r['position_type']}
-                </span>
-            </td>
-            <td style="padding: 12px 8px; border-bottom: 1px solid #eee; text-align: right;">Rs. {r['entry_price']:,.2f}</td>
-            <td style="padding: 12px 8px; border-bottom: 1px solid #eee; text-align: right;">Rs. {r['current_price']:,.2f}</td>
-            <td style="padding: 12px 8px; border-bottom: 1px solid #eee; text-align: right; color: {pnl_color}; font-weight: bold;">
-                {r['pnl_percent']:+.2f}%<br>
-                <small>Rs. {r['pnl_amount']:+,.2f}</small>
-            </td>
-            <td style="padding: 12px 8px; border-bottom: 1px solid #eee; text-align: center;">{r['rsi']:.1f}</td>
-            <td style="padding: 12px 8px; border-bottom: 1px solid #eee; text-align: center; color: {'#28a745' if r['trend'] == 'BULLISH' else '#dc3545'};">
-                {r['trend']}
-            </td>
-            <td style="padding: 12px 8px; border-bottom: 1px solid #eee; text-align: center;">
-                <span style="background: {status_color}; color: white; padding: 2px 8px; border-radius: 3px; font-size: 12px;">
-                    {r['status']}
-                </span>
-            </td>
-        </tr>
-        """
-    
-    # Build alerts section
-    alerts_html = ""
-    for r in results:
-        for alert in r.get('alerts', []):
-            priority_color = '#dc3545' if alert['priority'] == 'CRITICAL' else '#fd7e14' if alert['priority'] == 'HIGH' else '#ffc107'
-            alerts_html += f"""
-            <div style="background: #f8f9fa; padding: 12px; margin: 8px 0; border-radius: 8px; border-left: 4px solid {priority_color};">
-                <strong>[{alert['priority']}] {r['ticker']}</strong>: {alert['type']}<br>
-                <small style="color: #666;">{alert['message']}</small><br>
-                <strong style="color: #007bff;">Action: {alert['action']}</strong>
-            </div>
-            """
-    
-    if not alerts_html:
-        alerts_html = '<p style="color: #28a745; text-align: center; padding: 20px;">All positions are healthy! No alerts.</p>'
-    
-    market_color = '#28a745' if market['is_open'] else '#dc3545'
-    
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f5f5f5;">
-    <div style="background: white; border-radius: 15px; padding: 25px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-        
-        <!-- Header -->
-        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 25px;">
-            <h1 style="margin: 0; font-size: 24px;">Portfolio Summary</h1>
-            <p style="margin: 10px 0 0 0; opacity: 0.9;">{ist_now.strftime('%A, %B %d, %Y')} | {ist_now.strftime('%H:%M')} IST</p>
-        </div>
-        
-        <!-- Summary Cards -->
-        <div style="display: flex; justify-content: space-between; margin-bottom: 25px; flex-wrap: wrap;">
-            <div style="flex: 1; min-width: 120px; background: #f8f9fa; padding: 20px; border-radius: 10px; text-align: center; margin: 5px;">
-                <div style="font-size: 24px; font-weight: bold; color: {total_pnl_color};">Rs. {total_pnl:+,.2f}</div>
-                <div style="color: #666; font-size: 12px; margin-top: 5px;">Total P&L</div>
-            </div>
-            <div style="flex: 1; min-width: 120px; background: #f8f9fa; padding: 20px; border-radius: 10px; text-align: center; margin: 5px;">
-                <div style="font-size: 24px; font-weight: bold; color: #333;">{len(results)}</div>
-                <div style="color: #666; font-size: 12px; margin-top: 5px;">Positions</div>
-            </div>
-            <div style="flex: 1; min-width: 120px; background: #f8f9fa; padding: 20px; border-radius: 10px; text-align: center; margin: 5px;">
-                <div style="font-size: 24px; font-weight: bold; color: {'#dc3545' if total_alerts > 0 else '#28a745'};">{total_alerts}</div>
-                <div style="color: #666; font-size: 12px; margin-top: 5px;">Alerts</div>
-            </div>
-            <div style="flex: 1; min-width: 120px; background: #f8f9fa; padding: 20px; border-radius: 10px; text-align: center; margin: 5px;">
-                <div style="font-size: 18px; font-weight: bold;">
-                    <span style="background: {market_color}; color: white; padding: 3px 10px; border-radius: 3px;">{market['status']}</span>
-                </div>
-                <div style="color: #666; font-size: 12px; margin-top: 8px;">Market</div>
-            </div>
-        </div>
-        
-        <!-- Positions Table -->
-        <div style="margin-bottom: 25px;">
-            <h3 style="color: #333; border-bottom: 2px solid #eee; padding-bottom: 10px;">Your Positions</h3>
-            <div style="overflow-x: auto;">
-                <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-                    <thead>
-                        <tr style="background: #f8f9fa;">
-                            <th style="padding: 12px 8px; text-align: left;">Ticker</th>
-                            <th style="padding: 12px 8px; text-align: left;">Type</th>
-                            <th style="padding: 12px 8px; text-align: right;">Entry</th>
-                            <th style="padding: 12px 8px; text-align: right;">Current</th>
-                            <th style="padding: 12px 8px; text-align: right;">P&L</th>
-                            <th style="padding: 12px 8px; text-align: center;">RSI</th>
-                            <th style="padding: 12px 8px; text-align: center;">Trend</th>
-                            <th style="padding: 12px 8px; text-align: center;">Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {positions_html}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        
-        <!-- Alerts Section -->
-        <div style="margin-bottom: 25px;">
-            <h3 style="color: #333; border-bottom: 2px solid #eee; padding-bottom: 10px;">Alerts & Recommendations</h3>
-            {alerts_html}
-        </div>
-        
-        <!-- Footer -->
-        <div style="text-align: center; color: #999; font-size: 12px; padding-top: 20px; border-top: 1px solid #eee;">
-            <p>Portfolio Monitor v3.0 | Powered by GitHub Actions</p>
-            <p>Data from Yahoo Finance | Generated at {ist_now.strftime('%Y-%m-%d %H:%M:%S')} IST</p>
-        </div>
-    </div>
-</body>
-</html>
-    """
-    
-    subject = f"Portfolio Summary: {ist_now.strftime('%Y-%m-%d %H:%M')} | P&L: Rs. {total_pnl:+,.2f}"
-    return send_email(subject, html)
 
 # ============================================================================
 # TECHNICAL ANALYSIS FUNCTIONS
@@ -437,85 +95,382 @@ def calculate_atr(high, low, close, period=14):
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
-def calculate_trend(prices, period=20):
+def calculate_bollinger_bands(prices, period=20, std_dev=2):
     sma = prices.rolling(window=period).mean()
-    above_sma = (prices > sma).astype(int)
-    trend_consistency = above_sma.rolling(window=period).mean().iloc[-1]
-    direction = "BULLISH" if trend_consistency > 0.5 else "BEARISH"
-    strength = trend_consistency * 100 if direction == "BULLISH" else (1 - trend_consistency) * 100
-    return direction, strength
+    std = prices.rolling(window=period).std()
+    upper = sma + (std * std_dev)
+    lower = sma - (std * std_dev)
+    return upper, sma, lower
 
-def detect_trend_reversal(df, position_type):
-    if len(df) < 20:
-        return False, ""
+def calculate_volume_profile(df):
+    """Analyze volume to detect buying/selling pressure"""
+    avg_volume = df['Volume'].rolling(20).mean().iloc[-1]
+    current_volume = df['Volume'].iloc[-1]
+    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+    
+    # Check if volume confirms price movement
+    price_change = df['Close'].iloc[-1] - df['Close'].iloc[-2]
+    
+    if price_change > 0 and volume_ratio > 1.3:
+        return "STRONG_BUYING", volume_ratio
+    elif price_change < 0 and volume_ratio > 1.3:
+        return "STRONG_SELLING", volume_ratio
+    elif price_change > 0:
+        return "WEAK_BUYING", volume_ratio
+    elif price_change < 0:
+        return "WEAK_SELLING", volume_ratio
+    else:
+        return "NEUTRAL", volume_ratio
+
+def find_support_resistance(df, lookback=50):
+    """Find key support and resistance levels"""
+    high = df['High'].tail(lookback)
+    low = df['Low'].tail(lookback)
+    close = df['Close'].tail(lookback)
+    
+    # Find pivot points
+    pivot_highs = []
+    pivot_lows = []
+    
+    for i in range(2, len(high) - 2):
+        # Pivot high
+        if high.iloc[i] > high.iloc[i-1] and high.iloc[i] > high.iloc[i-2] and \
+           high.iloc[i] > high.iloc[i+1] and high.iloc[i] > high.iloc[i+2]:
+            pivot_highs.append(high.iloc[i])
+        
+        # Pivot low
+        if low.iloc[i] < low.iloc[i-1] and low.iloc[i] < low.iloc[i-2] and \
+           low.iloc[i] < low.iloc[i+1] and low.iloc[i] < low.iloc[i+2]:
+            pivot_lows.append(low.iloc[i])
+    
+    current_price = close.iloc[-1]
+    
+    # Find nearest support (below current price)
+    supports = [p for p in pivot_lows if p < current_price]
+    nearest_support = max(supports) if supports else current_price * 0.95
+    
+    # Find nearest resistance (above current price)
+    resistances = [p for p in pivot_highs if p > current_price]
+    nearest_resistance = min(resistances) if resistances else current_price * 1.05
+    
+    return nearest_support, nearest_resistance
+
+def calculate_momentum_score(df):
+    """Calculate overall momentum score (0-100)"""
+    close = df['Close']
+    
+    score = 50  # Start neutral
+    
+    # RSI contribution (0-20 points)
+    rsi = calculate_rsi(close).iloc[-1]
+    if rsi > 60:
+        score += (rsi - 60) * 0.5  # Up to +20
+    elif rsi < 40:
+        score -= (40 - rsi) * 0.5  # Down to -20
+    
+    # MACD contribution (0-20 points)
+    macd, signal, histogram = calculate_macd(close)
+    if histogram.iloc[-1] > 0:
+        if histogram.iloc[-1] > histogram.iloc[-2]:
+            score += 20  # Strong bullish
+        else:
+            score += 10  # Weak bullish
+    else:
+        if histogram.iloc[-1] < histogram.iloc[-2]:
+            score -= 20  # Strong bearish
+        else:
+            score -= 10  # Weak bearish
+    
+    # Moving average contribution (0-20 points)
+    sma_20 = close.rolling(20).mean().iloc[-1]
+    sma_50 = close.rolling(50).mean().iloc[-1]
+    current_price = close.iloc[-1]
+    
+    if current_price > sma_20 > sma_50:
+        score += 20  # Strong uptrend
+    elif current_price > sma_20:
+        score += 10  # Above short-term MA
+    elif current_price < sma_20 < sma_50:
+        score -= 20  # Strong downtrend
+    elif current_price < sma_20:
+        score -= 10  # Below short-term MA
+    
+    # Price momentum (0-10 points)
+    returns_5d = (close.iloc[-1] / close.iloc[-6] - 1) * 100
+    score += min(10, max(-10, returns_5d * 2))
+    
+    return max(0, min(100, score))
+
+# ============================================================================
+# SMART PREDICTION FUNCTIONS
+# ============================================================================
+
+def predict_stop_loss_risk(df, current_price, stop_loss, position_type):
+    """
+    Predict likelihood of hitting stop loss
+    Returns: risk_score (0-100), reasons, recommendation
+    """
+    risk_score = 0
+    reasons = []
     
     close = df['Close']
-    rsi = calculate_rsi(close).iloc[-1]
-    macd, signal, histogram = calculate_macd(close)
-    macd_hist = histogram.iloc[-1]
-    macd_hist_prev = histogram.iloc[-3:-1].mean()
-    sma_20 = close.rolling(20).mean().iloc[-1]
-    current_price = close.iloc[-1]
-    ema_9 = close.ewm(span=9).mean().iloc[-1]
     
-    reversal_signals = []
-    reversal_score = 0
+    # 1. Distance to stop loss
+    if position_type == "LONG":
+        distance_pct = ((current_price - stop_loss) / current_price) * 100
+    else:
+        distance_pct = ((stop_loss - current_price) / current_price) * 100
+    
+    if distance_pct < 1:
+        risk_score += 40
+        reasons.append(f"Very close to SL ({distance_pct:.1f}% away)")
+    elif distance_pct < 2:
+        risk_score += 25
+        reasons.append(f"Close to SL ({distance_pct:.1f}% away)")
+    elif distance_pct < 3:
+        risk_score += 10
+    
+    # 2. Trend direction
+    sma_20 = close.rolling(20).mean().iloc[-1]
+    sma_50 = close.rolling(50).mean().iloc[-1]
     
     if position_type == "LONG":
-        if rsi > 70:
-            reversal_signals.append("RSI overbought")
-            reversal_score += 1
-        if macd_hist < 0 and macd_hist < macd_hist_prev:
-            reversal_signals.append("MACD bearish")
-            reversal_score += 1
-        if current_price < ema_9:
-            reversal_signals.append("Below EMA 9")
-            reversal_score += 1
         if current_price < sma_20:
-            reversal_signals.append("Below SMA 20")
-            reversal_score += 2
-    else:
-        if rsi < 30:
-            reversal_signals.append("RSI oversold")
-            reversal_score += 1
-        if macd_hist > 0 and macd_hist > macd_hist_prev:
-            reversal_signals.append("MACD bullish")
-            reversal_score += 1
-        if current_price > ema_9:
-            reversal_signals.append("Above EMA 9")
-            reversal_score += 1
+            risk_score += 15
+            reasons.append("Price below 20 SMA (bearish)")
+        if current_price < sma_50:
+            risk_score += 10
+            reasons.append("Price below 50 SMA (bearish)")
+        if sma_20 < sma_50:
+            risk_score += 10
+            reasons.append("20 SMA below 50 SMA (downtrend)")
+    else:  # SHORT
         if current_price > sma_20:
-            reversal_signals.append("Above SMA 20")
-            reversal_score += 2
+            risk_score += 15
+            reasons.append("Price above 20 SMA (bullish)")
+        if current_price > sma_50:
+            risk_score += 10
+            reasons.append("Price above 50 SMA (bullish)")
     
-    threshold = 3 * CONFIG['trend_reversal_sensitivity']
-    return reversal_score >= threshold, ", ".join(reversal_signals)
+    # 3. MACD direction
+    macd, signal, histogram = calculate_macd(close)
+    
+    if position_type == "LONG":
+        if histogram.iloc[-1] < 0 and histogram.iloc[-1] < histogram.iloc[-2]:
+            risk_score += 15
+            reasons.append("MACD bearish and falling")
+        elif histogram.iloc[-1] < 0:
+            risk_score += 8
+    else:
+        if histogram.iloc[-1] > 0 and histogram.iloc[-1] > histogram.iloc[-2]:
+            risk_score += 15
+            reasons.append("MACD bullish and rising")
+    
+    # 4. RSI
+    rsi = calculate_rsi(close).iloc[-1]
+    
+    if position_type == "LONG" and rsi < 35:
+        risk_score += 10
+        reasons.append(f"RSI weak ({rsi:.1f})")
+    elif position_type == "SHORT" and rsi > 65:
+        risk_score += 10
+        reasons.append(f"RSI strong ({rsi:.1f})")
+    
+    # 5. Volume analysis
+    volume_type, volume_ratio = calculate_volume_profile(df)
+    
+    if position_type == "LONG" and volume_type == "STRONG_SELLING":
+        risk_score += 15
+        reasons.append(f"Strong selling pressure ({volume_ratio:.1f}x volume)")
+    elif position_type == "SHORT" and volume_type == "STRONG_BUYING":
+        risk_score += 15
+        reasons.append(f"Strong buying pressure ({volume_ratio:.1f}x volume)")
+    
+    # 6. Recent price action
+    last_3_candles = close.tail(3)
+    if position_type == "LONG":
+        if all(last_3_candles.diff().dropna() < 0):
+            risk_score += 10
+            reasons.append("3 consecutive red candles")
+    else:
+        if all(last_3_candles.diff().dropna() > 0):
+            risk_score += 10
+            reasons.append("3 consecutive green candles")
+    
+    # Cap at 100
+    risk_score = min(100, risk_score)
+    
+    # Generate recommendation
+    if risk_score >= 70:
+        recommendation = "EXIT NOW - High risk of SL hit"
+        priority = "CRITICAL"
+    elif risk_score >= 50:
+        recommendation = "CONSIDER EXIT - Moderate risk"
+        priority = "HIGH"
+    elif risk_score >= 30:
+        recommendation = "WATCH CLOSELY - Some warning signs"
+        priority = "MEDIUM"
+    else:
+        recommendation = "HOLD - Position looks safe"
+        priority = "LOW"
+    
+    return risk_score, reasons, recommendation, priority
+
+def predict_upside_potential(df, current_price, target1, target2, position_type):
+    """
+    Predict if stock can go higher after hitting target
+    Returns: upside_score (0-100), new_target, recommendation
+    """
+    upside_score = 50  # Start neutral
+    reasons = []
+    
+    close = df['Close']
+    high = df['High']
+    
+    # 1. Momentum score
+    momentum = calculate_momentum_score(df)
+    if momentum > 70:
+        upside_score += 20
+        reasons.append(f"Strong momentum ({momentum:.0f}/100)")
+    elif momentum > 55:
+        upside_score += 10
+        reasons.append(f"Good momentum ({momentum:.0f}/100)")
+    elif momentum < 40:
+        upside_score -= 15
+        reasons.append(f"Weak momentum ({momentum:.0f}/100)")
+    
+    # 2. RSI - not overbought
+    rsi = calculate_rsi(close).iloc[-1]
+    
+    if position_type == "LONG":
+        if rsi < 60:
+            upside_score += 15
+            reasons.append(f"RSI has room to run ({rsi:.1f})")
+        elif rsi > 75:
+            upside_score -= 20
+            reasons.append(f"RSI overbought ({rsi:.1f})")
+    else:  # SHORT
+        if rsi > 40:
+            upside_score += 15
+            reasons.append(f"RSI has room to fall ({rsi:.1f})")
+        elif rsi < 25:
+            upside_score -= 20
+            reasons.append(f"RSI oversold ({rsi:.1f})")
+    
+    # 3. Volume confirmation
+    volume_type, volume_ratio = calculate_volume_profile(df)
+    
+    if position_type == "LONG" and volume_type == "STRONG_BUYING":
+        upside_score += 15
+        reasons.append(f"Strong buying volume ({volume_ratio:.1f}x)")
+    elif position_type == "SHORT" and volume_type == "STRONG_SELLING":
+        upside_score += 15
+        reasons.append(f"Strong selling volume ({volume_ratio:.1f}x)")
+    
+    # 4. Bollinger Band position
+    upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(close)
+    
+    if position_type == "LONG":
+        bb_position = (current_price - lower_bb.iloc[-1]) / (upper_bb.iloc[-1] - lower_bb.iloc[-1])
+        if bb_position < 0.7:
+            upside_score += 10
+            reasons.append("Room to upper Bollinger Band")
+        elif bb_position > 0.95:
+            upside_score -= 15
+            reasons.append("At upper Bollinger Band")
+    else:
+        bb_position = (current_price - lower_bb.iloc[-1]) / (upper_bb.iloc[-1] - lower_bb.iloc[-1])
+        if bb_position > 0.3:
+            upside_score += 10
+            reasons.append("Room to lower Bollinger Band")
+    
+    # 5. Find resistance for new target
+    support, resistance = find_support_resistance(df)
+    atr = calculate_atr(high, df['Low'], close).iloc[-1]
+    
+    if position_type == "LONG":
+        # New target based on resistance and ATR
+        new_target = min(resistance, current_price + (atr * 3))
+        potential_gain = ((new_target - current_price) / current_price) * 100
+    else:
+        new_target = max(support, current_price - (atr * 3))
+        potential_gain = ((current_price - new_target) / current_price) * 100
+    
+    if potential_gain > 5:
+        upside_score += 10
+        reasons.append(f"Potential {potential_gain:.1f}% more")
+    
+    # Cap score
+    upside_score = max(0, min(100, upside_score))
+    
+    # Generate recommendation
+    if upside_score >= 70:
+        recommendation = f"HOLD - Strong upside to Rs.{new_target:.2f}"
+        action = "HOLD_EXTEND_TARGET"
+    elif upside_score >= 50:
+        recommendation = f"PARTIAL EXIT - Book 50%, hold rest for Rs.{new_target:.2f}"
+        action = "PARTIAL_EXIT"
+    else:
+        recommendation = "EXIT - Book profits now"
+        action = "EXIT"
+    
+    return upside_score, new_target, reasons, recommendation, action
+
+def calculate_dynamic_targets(df, entry_price, position_type):
+    """Calculate smart dynamic targets based on ATR and S/R levels"""
+    close = df['Close']
+    current_price = close.iloc[-1]
+    
+    atr = calculate_atr(df['High'], df['Low'], close).iloc[-1]
+    support, resistance = find_support_resistance(df)
+    
+    if position_type == "LONG":
+        # Target 1: 1.5x ATR or next resistance
+        target1_atr = current_price + (atr * 1.5)
+        target1 = min(target1_atr, resistance) if resistance > current_price else target1_atr
+        
+        # Target 2: 3x ATR
+        target2 = current_price + (atr * 3)
+        
+        # Stop loss: 2x ATR below entry or support
+        stop_loss_atr = entry_price - (atr * 2)
+        stop_loss = max(stop_loss_atr, support * 0.99) if support < entry_price else stop_loss_atr
+        
+        # Trailing stop (if in profit)
+        if current_price > entry_price:
+            trail_stop = current_price - (atr * 1.5)
+        else:
+            trail_stop = stop_loss
+    else:  # SHORT
+        target1_atr = current_price - (atr * 1.5)
+        target1 = max(target1_atr, support) if support < current_price else target1_atr
+        
+        target2 = current_price - (atr * 3)
+        
+        stop_loss_atr = entry_price + (atr * 2)
+        stop_loss = min(stop_loss_atr, resistance * 1.01) if resistance > entry_price else stop_loss_atr
+        
+        if current_price < entry_price:
+            trail_stop = current_price + (atr * 1.5)
+        else:
+            trail_stop = stop_loss
+    
+    return {
+        'target1': target1,
+        'target2': target2,
+        'stop_loss': stop_loss,
+        'trail_stop': trail_stop,
+        'atr': atr,
+        'support': support,
+        'resistance': resistance
+    }
 
 # ============================================================================
-# PORTFOLIO FUNCTIONS
+# SMART ANALYSIS
 # ============================================================================
 
-def load_portfolio():
-    """Load portfolio from Excel file"""
-    if not os.path.exists(CONFIG['excel_file']):
-        log(f"Excel file not found: {CONFIG['excel_file']}", "ERROR")
-        return None
-    
-    try:
-        df = pd.read_excel(CONFIG['excel_file'], sheet_name='Portfolio')
-        
-        # Filter active positions
-        if 'Status' in df.columns:
-            df = df[df['Status'].str.upper() == 'ACTIVE']
-        
-        log(f"Loaded {len(df)} active positions")
-        return df
-    except Exception as e:
-        log(f"Error loading portfolio: {e}", "ERROR")
-        return None
-
-def analyze_stock(position_data, alert_history):
-    """Analyze a single stock position"""
+def smart_analyze_position(position_data):
+    """Enhanced analysis with predictions"""
     ticker = str(position_data['Ticker'])
     symbol = ticker if '.NS' in ticker else f"{ticker}.NS"
     position_type = str(position_data['Position']).upper()
@@ -525,17 +480,17 @@ def analyze_stock(position_data, alert_history):
     target1 = float(position_data['Target_1'])
     target2 = float(position_data.get('Target_2', target1 * 1.1))
     
-    log(f"Analyzing {ticker}...")
+    log(f"Smart analyzing {ticker}...")
     
-    # Fetch stock data
+    # Fetch data
     try:
         stock = yf.Ticker(symbol)
-        df = stock.history(period="3mo")
+        df = stock.history(period="6mo")  # Get more data for better analysis
         
         if df.empty:
             symbol = symbol.replace('.NS', '.BO')
             stock = yf.Ticker(symbol)
-            df = stock.history(period="3mo")
+            df = stock.history(period="6mo")
         
         if df.empty:
             log(f"No data for {ticker}", "WARNING")
@@ -548,91 +503,139 @@ def analyze_stock(position_data, alert_history):
         log(f"Error fetching {ticker}: {e}", "ERROR")
         return None
     
-    # Calculate P&L
+    # Basic calculations
     if position_type == "LONG":
         pnl_percent = ((current_price - entry_price) / entry_price) * 100
         pnl_amount = (current_price - entry_price) * quantity
-        distance_to_sl = ((current_price - stop_loss) / current_price) * 100
-        distance_to_t1 = ((target1 - current_price) / current_price) * 100
     else:
         pnl_percent = ((entry_price - current_price) / entry_price) * 100
         pnl_amount = (entry_price - current_price) * quantity
-        distance_to_sl = ((stop_loss - current_price) / current_price) * 100
-        distance_to_t1 = ((current_price - target1) / current_price) * 100
     
-    # Calculate technical indicators
+    # Technical indicators
     rsi = float(calculate_rsi(df['Close']).iloc[-1])
-    trend_dir, trend_str = calculate_trend(df['Close'])
     macd, signal, histogram = calculate_macd(df['Close'])
     macd_hist = float(histogram.iloc[-1])
-    atr = float(calculate_atr(df['High'], df['Low'], df['Close']).iloc[-1])
+    momentum_score = calculate_momentum_score(df)
+    volume_type, volume_ratio = calculate_volume_profile(df)
     
-    # Generate alerts
+    # SMART PREDICTIONS
+    
+    # 1. Predict stop loss risk
+    sl_risk, sl_reasons, sl_recommendation, sl_priority = predict_stop_loss_risk(
+        df, current_price, stop_loss, position_type
+    )
+    
+    # 2. Check if target hit and predict upside
+    target_hit = False
+    upside_score = 0
+    new_target = target2
+    upside_reasons = []
+    upside_recommendation = ""
+    
+    if position_type == "LONG" and current_price >= target1:
+        target_hit = True
+        upside_score, new_target, upside_reasons, upside_recommendation, upside_action = predict_upside_potential(
+            df, current_price, target1, target2, position_type
+        )
+    elif position_type == "SHORT" and current_price <= target1:
+        target_hit = True
+        upside_score, new_target, upside_reasons, upside_recommendation, upside_action = predict_upside_potential(
+            df, current_price, target1, target2, position_type
+        )
+    
+    # 3. Calculate dynamic levels
+    dynamic_levels = calculate_dynamic_targets(df, entry_price, position_type)
+    
+    # Generate smart alerts
     alerts = []
     
-    # Stop loss check
+    # Early exit warning (BEFORE SL hits)
+    if sl_risk >= 50 and not (position_type == "LONG" and current_price <= stop_loss) and \
+       not (position_type == "SHORT" and current_price >= stop_loss):
+        alerts.append({
+            'type': 'EARLY EXIT WARNING',
+            'priority': sl_priority,
+            'message': f"SL Risk: {sl_risk}% - {', '.join(sl_reasons[:2])}",
+            'action': sl_recommendation
+        })
+    
+    # Stop loss hit
     sl_hit = (position_type == "LONG" and current_price <= stop_loss) or \
              (position_type == "SHORT" and current_price >= stop_loss)
     if sl_hit:
         alerts.append({
             'type': 'STOP LOSS HIT',
             'priority': 'CRITICAL',
-            'message': f'Price Rs.{current_price:.2f} breached stop loss Rs.{stop_loss:.2f}',
+            'message': f'Price Rs.{current_price:.2f} hit stop loss Rs.{stop_loss:.2f}',
             'action': 'EXIT IMMEDIATELY'
         })
     
-    # Target checks
-    if position_type == "LONG":
-        if current_price >= target2:
-            alerts.append({'type': 'TARGET 2 HIT', 'priority': 'HIGH', 'message': 'Target 2 reached!', 'action': 'BOOK FULL PROFITS'})
-        elif current_price >= target1:
-            alerts.append({'type': 'TARGET 1 HIT', 'priority': 'MEDIUM', 'message': 'Target 1 reached!', 'action': 'BOOK 50% PROFITS'})
-    else:
-        if current_price <= target2:
-            alerts.append({'type': 'TARGET 2 HIT', 'priority': 'HIGH', 'message': 'Target 2 reached!', 'action': 'BOOK FULL PROFITS'})
-        elif current_price <= target1:
-            alerts.append({'type': 'TARGET 1 HIT', 'priority': 'MEDIUM', 'message': 'Target 1 reached!', 'action': 'BOOK 50% PROFITS'})
+    # Target hit with upside analysis
+    if target_hit:
+        if upside_score >= 60:
+            alerts.append({
+                'type': 'TARGET HIT - HOLD FOR MORE',
+                'priority': 'HIGH',
+                'message': f"Upside potential: {upside_score}% - {', '.join(upside_reasons[:2])}",
+                'action': f"{upside_recommendation} | New Target: Rs.{new_target:.2f}"
+            })
+        else:
+            alerts.append({
+                'type': 'TARGET HIT - BOOK PROFITS',
+                'priority': 'HIGH',
+                'message': f"Limited upside ({upside_score}%) - {', '.join(upside_reasons[:2])}",
+                'action': 'BOOK PROFITS NOW'
+            })
     
     # Trailing stop loss suggestion
-    if pnl_percent >= CONFIG['trailing_sl_trigger']:
-        if position_type == "LONG":
-            suggested_sl = df['High'].tail(10).max() - (atr * 2)
-            if suggested_sl > stop_loss:
-                alerts.append({'type': 'TRAIL SL', 'priority': 'MEDIUM', 
-                             'message': f'Trail SL to Rs.{suggested_sl:.2f}', 'action': 'UPDATE STOP LOSS'})
-        else:
-            suggested_sl = df['Low'].tail(10).min() + (atr * 2)
-            if suggested_sl < stop_loss:
-                alerts.append({'type': 'TRAIL SL', 'priority': 'MEDIUM',
-                             'message': f'Trail SL to Rs.{suggested_sl:.2f}', 'action': 'UPDATE STOP LOSS'})
+    if pnl_percent >= 3:  # In good profit
+        if position_type == "LONG" and dynamic_levels['trail_stop'] > stop_loss:
+            alerts.append({
+                'type': 'TRAIL STOP LOSS',
+                'priority': 'MEDIUM',
+                'message': f"Lock in profits. Move SL from Rs.{stop_loss:.2f} to Rs.{dynamic_levels['trail_stop']:.2f}",
+                'action': f"New SL: Rs.{dynamic_levels['trail_stop']:.2f}"
+            })
+        elif position_type == "SHORT" and dynamic_levels['trail_stop'] < stop_loss:
+            alerts.append({
+                'type': 'TRAIL STOP LOSS',
+                'priority': 'MEDIUM',
+                'message': f"Lock in profits. Move SL from Rs.{stop_loss:.2f} to Rs.{dynamic_levels['trail_stop']:.2f}",
+                'action': f"New SL: Rs.{dynamic_levels['trail_stop']:.2f}"
+            })
     
-    # Trend reversal detection
-    is_reversal, reversal_reasons = detect_trend_reversal(df, position_type)
-    if is_reversal:
-        alerts.append({'type': 'TREND REVERSAL', 'priority': 'HIGH',
-                      'message': reversal_reasons, 'action': 'REVIEW POSITION'})
+    # Dynamic target update suggestion
+    if not target_hit and pnl_percent > 0:
+        if position_type == "LONG" and dynamic_levels['target1'] > target1:
+            alerts.append({
+                'type': 'UPDATE TARGET',
+                'priority': 'LOW',
+                'message': f"Based on momentum, consider new target Rs.{dynamic_levels['target1']:.2f}",
+                'action': 'OPTIONAL: Extend target'
+            })
     
-    # High loss warning
-    if pnl_percent <= CONFIG['alert_on_loss_percent']:
-        alerts.append({'type': 'HIGH LOSS', 'priority': 'HIGH',
-                      'message': f'Loss exceeds {abs(CONFIG["alert_on_loss_percent"])}%', 'action': 'REVIEW POSITION'})
-    
-    # High profit notification
-    if pnl_percent >= CONFIG['alert_on_profit_percent']:
-        alerts.append({'type': 'HIGH PROFIT', 'priority': 'MEDIUM',
-                      'message': f'Profit exceeds {CONFIG["alert_on_profit_percent"]}%', 'action': 'CONSIDER BOOKING PROFITS'})
-    
-    # Determine overall status
-    if any(a['priority'] == 'CRITICAL' for a in alerts):
-        status = 'CRITICAL'
-    elif any(a['priority'] == 'HIGH' for a in alerts):
-        status = 'WARNING'
-    elif alerts:
-        status = 'INFO'
+    # Determine overall recommendation
+    if sl_hit:
+        overall_action = "EXIT"
+        overall_status = "CRITICAL"
+    elif sl_risk >= 70:
+        overall_action = "EXIT_EARLY"
+        overall_status = "CRITICAL"
+    elif sl_risk >= 50:
+        overall_action = "WATCH_CLOSELY"
+        overall_status = "WARNING"
+    elif target_hit and upside_score >= 60:
+        overall_action = "HOLD_EXTEND"
+        overall_status = "OPPORTUNITY"
+    elif target_hit:
+        overall_action = "BOOK_PROFITS"
+        overall_status = "SUCCESS"
+    elif pnl_percent >= 3:
+        overall_action = "TRAIL_SL"
+        overall_status = "GOOD"
     else:
-        status = 'OK'
-    
-    log(f"  {ticker}: Rs.{current_price:.2f} | P&L: {pnl_percent:+.2f}% | Status: {status}")
+        overall_action = "HOLD"
+        overall_status = "OK"
     
     return {
         'ticker': ticker,
@@ -645,94 +648,262 @@ def analyze_stock(position_data, alert_history):
         'quantity': quantity,
         'pnl_percent': pnl_percent,
         'pnl_amount': pnl_amount,
-        'distance_to_sl': distance_to_sl,
-        'distance_to_t1': distance_to_t1,
+        
+        # Technical
         'rsi': rsi,
-        'trend': trend_dir,
-        'trend_strength': trend_str,
         'macd_histogram': macd_hist,
+        'momentum_score': momentum_score,
+        'volume_type': volume_type,
+        'volume_ratio': volume_ratio,
+        
+        # Smart predictions
+        'sl_risk_score': sl_risk,
+        'sl_reasons': sl_reasons,
+        'upside_score': upside_score,
+        'upside_reasons': upside_reasons,
+        'new_suggested_target': new_target,
+        
+        # Dynamic levels
+        'dynamic_target1': dynamic_levels['target1'],
+        'dynamic_target2': dynamic_levels['target2'],
+        'dynamic_stop_loss': dynamic_levels['stop_loss'],
+        'trail_stop': dynamic_levels['trail_stop'],
+        'support': dynamic_levels['support'],
+        'resistance': dynamic_levels['resistance'],
+        
+        # Alerts and status
         'alerts': alerts,
-        'status': status
+        'overall_action': overall_action,
+        'overall_status': overall_status
     }
+
+# ============================================================================
+# EMAIL FUNCTION
+# ============================================================================
+
+def send_smart_email(results):
+    """Send comprehensive smart analysis email"""
+    ist_now = get_ist_now()
+    
+    total_pnl = sum(r['pnl_amount'] for r in results)
+    pnl_color = '#28a745' if total_pnl >= 0 else '#dc3545'
+    
+    # Count by status
+    critical_count = sum(1 for r in results if r['overall_status'] == 'CRITICAL')
+    warning_count = sum(1 for r in results if r['overall_status'] == 'WARNING')
+    
+    # Build positions HTML
+    positions_html = ""
+    for r in results:
+        status_colors = {
+            'CRITICAL': '#dc3545',
+            'WARNING': '#fd7e14',
+            'OPPORTUNITY': '#17a2b8',
+            'SUCCESS': '#28a745',
+            'GOOD': '#28a745',
+            'OK': '#6c757d'
+        }
+        status_color = status_colors.get(r['overall_status'], '#6c757d')
+        pnl_c = '#28a745' if r['pnl_percent'] >= 0 else '#dc3545'
+        
+        # Risk indicator
+        if r['sl_risk_score'] >= 70:
+            risk_display = f"<span style='color:#dc3545;font-weight:bold;'>HIGH RISK ({r['sl_risk_score']}%)</span>"
+        elif r['sl_risk_score'] >= 50:
+            risk_display = f"<span style='color:#fd7e14;'>MODERATE ({r['sl_risk_score']}%)</span>"
+        else:
+            risk_display = f"<span style='color:#28a745;'>LOW ({r['sl_risk_score']}%)</span>"
+        
+        # Alerts for this position
+        alerts_html = ""
+        for alert in r['alerts']:
+            alert_color = '#dc3545' if alert['priority'] == 'CRITICAL' else '#fd7e14' if alert['priority'] == 'HIGH' else '#ffc107'
+            alerts_html += f"""
+            <div style="background:{alert_color}20; border-left:4px solid {alert_color}; padding:10px; margin:5px 0; border-radius:5px;">
+                <strong>[{alert['priority']}] {alert['type']}</strong><br>
+                {alert['message']}<br>
+                <strong>Action: {alert['action']}</strong>
+            </div>
+            """
+        
+        positions_html += f"""
+        <div style="background:#f8f9fa; padding:20px; border-radius:10px; margin:15px 0; border-left:5px solid {status_color};">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+                <div>
+                    <h3 style="margin:0; color:#333;">{r['ticker']}</h3>
+                    <span style="background:{'#28a745' if r['position_type']=='LONG' else '#dc3545'}; color:white; padding:3px 10px; border-radius:3px; font-size:12px;">
+                        {r['position_type']}
+                    </span>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size:24px; font-weight:bold; color:{pnl_c};">
+                        {r['pnl_percent']:+.2f}%
+                    </div>
+                    <div style="color:{pnl_c};">Rs. {r['pnl_amount']:+,.2f}</div>
+                </div>
+            </div>
+            
+            <table style="width:100%; font-size:14px;">
+                <tr>
+                    <td>Entry: Rs.{r['entry_price']:,.2f}</td>
+                    <td>Current: Rs.{r['current_price']:,.2f}</td>
+                    <td>SL: Rs.{r['stop_loss']:,.2f}</td>
+                    <td>Target: Rs.{r['target1']:,.2f}</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top:15px; padding:10px; background:white; border-radius:5px;">
+                <strong>Smart Analysis:</strong><br>
+                SL Risk: {risk_display} | 
+                Momentum: {r['momentum_score']:.0f}/100 | 
+                RSI: {r['rsi']:.1f} |
+                Volume: {r['volume_type'].replace('_', ' ')} ({r['volume_ratio']:.1f}x)
+            </div>
+            
+            <div style="margin-top:10px; padding:10px; background:#e3f2fd; border-radius:5px;">
+                <strong>Smart Levels:</strong><br>
+                Support: Rs.{r['support']:,.2f} | 
+                Resistance: Rs.{r['resistance']:,.2f} |
+                Trail SL: Rs.{r['trail_stop']:,.2f}
+            </div>
+            
+            {alerts_html if alerts_html else '<p style="color:#28a745; margin-top:10px;">✓ No alerts - Position looks good</p>'}
+            
+            <div style="margin-top:15px; padding:15px; background:{status_color}; color:white; border-radius:5px; text-align:center;">
+                <strong>RECOMMENDATION: {r['overall_action'].replace('_', ' ')}</strong>
+            </div>
+        </div>
+        """
+    
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family:Arial,sans-serif; max-width:800px; margin:0 auto; padding:20px; background:#f5f5f5;">
+    <div style="background:white; border-radius:15px; padding:25px; box-shadow:0 2px 10px rgba(0,0,0,0.1);">
+        
+        <div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); color:white; padding:30px; border-radius:10px; text-align:center; margin-bottom:25px;">
+            <h1 style="margin:0;">🧠 Smart Portfolio Analysis</h1>
+            <p style="margin:10px 0 0 0;">{ist_now.strftime('%A, %B %d, %Y')} | {ist_now.strftime('%H:%M')} IST</p>
+        </div>
+        
+        <div style="display:flex; justify-content:space-around; margin-bottom:25px; flex-wrap:wrap;">
+            <div style="flex:1; min-width:100px; background:#f8f9fa; padding:15px; border-radius:10px; text-align:center; margin:5px;">
+                <div style="font-size:24px; font-weight:bold; color:{pnl_color};">Rs. {total_pnl:+,.2f}</div>
+                <div style="color:#666; font-size:12px;">Total P&L</div>
+            </div>
+            <div style="flex:1; min-width:100px; background:#f8f9fa; padding:15px; border-radius:10px; text-align:center; margin:5px;">
+                <div style="font-size:24px; font-weight:bold; color:#dc3545;">{critical_count}</div>
+                <div style="color:#666; font-size:12px;">Critical</div>
+            </div>
+            <div style="flex:1; min-width:100px; background:#f8f9fa; padding:15px; border-radius:10px; text-align:center; margin:5px;">
+                <div style="font-size:24px; font-weight:bold; color:#fd7e14;">{warning_count}</div>
+                <div style="color:#666; font-size:12px;">Warnings</div>
+            </div>
+        </div>
+        
+        {positions_html}
+        
+        <div style="text-align:center; color:#999; font-size:12px; margin-top:20px; padding-top:20px; border-top:1px solid #eee;">
+            Smart Portfolio Monitor v4.0 | Predictive Analysis Enabled
+        </div>
+    </div>
+</body>
+</html>
+    """
+    
+    subject = f"🧠 Smart Analysis: {critical_count} Critical, {warning_count} Warnings | P&L: Rs.{total_pnl:+,.2f}"
+    
+    # Send email
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = CONFIG['sender_email']
+        msg['To'] = CONFIG['recipient_email']
+        msg.attach(MIMEText(html, 'html'))
+        
+        server = smtplib.SMTP(CONFIG['smtp_server'], CONFIG['smtp_port'])
+        server.starttls()
+        server.login(CONFIG['sender_email'], CONFIG['sender_password'])
+        server.sendmail(CONFIG['sender_email'], CONFIG['recipient_email'], msg.as_string())
+        server.quit()
+        
+        log(f"Smart email sent!")
+        return True
+    except Exception as e:
+        log(f"Email error: {e}", "ERROR")
+        return False
 
 # ============================================================================
 # MAIN FUNCTION
 # ============================================================================
 
-def run_monitor(force_run=False, send_summary=True):
-    """Main monitoring function"""
+def run_smart_monitor(force_run=False):
+    """Run smart portfolio monitor"""
     ist_now = get_ist_now()
-    market = get_market_status()
     
-    log("=" * 60)
-    log("PORTFOLIO MONITOR - GITHUB ACTIONS")
-    log("=" * 60)
+    log("=" * 70)
+    log("SMART PORTFOLIO MONITOR v4.0 - PREDICTIVE EDITION")
+    log("=" * 70)
     log(f"Current IST: {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
-    log(f"Market Status: {market['status']} - {market['message']}")
     
     # Check market hours
-    if not force_run and not market['is_open']:
+    if not force_run and not is_market_hours():
         log("Market is closed. Use --force to run anyway.")
         return
     
     # Load portfolio
-    portfolio = load_portfolio()
-    if portfolio is None or len(portfolio) == 0:
-        log("No positions to monitor", "ERROR")
+    if not os.path.exists(CONFIG['excel_file']):
+        log(f"Portfolio file not found: {CONFIG['excel_file']}", "ERROR")
         return
     
-    # Load alert history
-    alert_history = load_alert_history()
+    try:
+        portfolio = pd.read_excel(CONFIG['excel_file'], sheet_name='Portfolio')
+        if 'Status' in portfolio.columns:
+            portfolio = portfolio[portfolio['Status'].str.upper() == 'ACTIVE']
+        log(f"Loaded {len(portfolio)} active positions")
+    except Exception as e:
+        log(f"Error loading portfolio: {e}", "ERROR")
+        return
     
     # Analyze each position
     results = []
-    alerts_sent = 0
     
-    log("-" * 60)
-    log("Analyzing positions...")
-    
+    log("-" * 70)
     for _, row in portfolio.iterrows():
-        result = analyze_stock(row.to_dict(), alert_history)
+        result = smart_analyze_position(row.to_dict())
         if result:
             results.append(result)
             
-            # Send individual alert emails
+            # Print summary
+            status_icon = {'CRITICAL': '🔴', 'WARNING': '🟡', 'OPPORTUNITY': '🔵', 
+                          'SUCCESS': '🟢', 'GOOD': '🟢', 'OK': '⚪'}.get(result['overall_status'], '⚪')
+            
+            log(f"  {status_icon} {result['ticker']}: Rs.{result['current_price']:.2f} | "
+                f"P&L: {result['pnl_percent']:+.2f}% | "
+                f"SL Risk: {result['sl_risk_score']}% | "
+                f"Action: {result['overall_action']}")
+            
             for alert in result['alerts']:
-                if can_send_alert(result['ticker'], alert['type'], alert_history):
-                    if send_alert_email(result, alert):
-                        alerts_sent += 1
-                        
-                        # Add to history
-                        if 'history' not in alert_history:
-                            alert_history['history'] = []
-                        alert_history['history'].insert(0, {
-                            'timestamp': datetime.now().isoformat(),
-                            'ticker': result['ticker'],
-                            'type': alert['type'],
-                            'priority': alert['priority'],
-                            'message': alert['message']
-                        })
-                        alert_history['history'] = alert_history['history'][:100]
+                log(f"     ⚠️ [{alert['priority']}] {alert['type']}: {alert['action']}")
     
-    # Save alert history
-    save_alert_history(alert_history)
+    # Send email
+    if results:
+        log("-" * 70)
+        send_smart_email(results)
     
-    # Send summary email
-    if send_summary and results:
-        log("-" * 60)
-        log("Sending summary email...")
-        send_summary_email(results, market)
-    
-    # Print summary
-    log("-" * 60)
+    # Summary
+    log("-" * 70)
     total_pnl = sum(r['pnl_amount'] for r in results)
-    log(f"SUMMARY:")
-    log(f"  Positions analyzed: {len(results)}")
-    log(f"  Alert emails sent: {alerts_sent}")
+    critical = sum(1 for r in results if r['overall_status'] == 'CRITICAL')
+    warnings = sum(1 for r in results if r['overall_status'] == 'WARNING')
+    
+    log("SMART ANALYSIS SUMMARY:")
+    log(f"  Positions: {len(results)}")
     log(f"  Total P&L: Rs. {total_pnl:+,.2f}")
-    log("=" * 60)
-    log("MONITOR COMPLETE")
-    log("=" * 60)
+    log(f"  Critical Actions: {critical}")
+    log(f"  Warnings: {warnings}")
+    log("=" * 70)
 
 # ============================================================================
 # ENTRY POINT
@@ -740,10 +911,8 @@ def run_monitor(force_run=False, send_summary=True):
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Portfolio Monitor')
+    parser = argparse.ArgumentParser(description='Smart Portfolio Monitor')
     parser.add_argument('--force', action='store_true', help='Run even if market is closed')
-    parser.add_argument('--no-summary', action='store_true', help='Skip summary email')
     args = parser.parse_args()
     
-    run_monitor(force_run=args.force, send_summary=not args.no_summary)
+    run_smart_monitor(force_run=args.force)
