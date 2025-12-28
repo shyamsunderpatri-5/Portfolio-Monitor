@@ -1351,27 +1351,44 @@ def smart_analyze_position(ticker, position_type, entry_price, quantity, stop_lo
 # ============================================================================
 
 def load_portfolio():
-    """Load portfolio from Excel"""
-    try:
-        if os.path.exists('my_portfolio.xlsx'):
-            df = pd.read_excel('my_portfolio.xlsx', sheet_name='Portfolio')
-            if 'Status' in df.columns:
-                df = df[df['Status'].str.upper() == 'ACTIVE']
-            return df
-    except Exception as e:
-        st.error(f"Error loading portfolio: {e}")
+    """Load portfolio from Google Sheets"""
+    # Your Google Sheets URL
+    GOOGLE_SHEETS_URL = "https://docs.google.com/spreadsheets/d/155htPsyom2e-dR5BZJx_cFzGxjQQjePJt3H2sRLSr6w/edit?usp=sharing"
     
-    # Return sample data
-    return pd.DataFrame({
-        'Ticker': ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK'],
-        'Position': ['LONG', 'LONG', 'SHORT', 'LONG'],
-        'Entry_Price': [1550.00, 3280.00, 1650.00, 970.00],
-        'Quantity': [10, 5, 8, 15],
-        'Stop_Loss': [1500.00, 3200.00, 1720.00, 940.00],
-        'Target_1': [1650.00, 3400.00, 1550.00, 1050.00],
-        'Target_2': [1750.00, 3500.00, 1450.00, 1100.00],
-        'Status': ['ACTIVE', 'ACTIVE', 'ACTIVE', 'ACTIVE']
-    })
+    try:
+        # Convert to export URL
+        sheet_id = GOOGLE_SHEETS_URL.split('/d/')[1].split('/')[0]
+        export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid=0"
+        
+        # Read from Google Sheets
+        df = pd.read_csv(export_url)
+        
+        # Filter active positions
+        if 'Status' in df.columns:
+            df = df[df['Status'].str.upper() == 'ACTIVE']
+        
+        # Clean column names (remove extra spaces)
+        df.columns = df.columns.str.strip()
+        
+        st.success(f"✅ Loaded {len(df)} active positions from Google Sheets")
+        return df
+        
+    except Exception as e:
+        st.error(f"❌ Error loading from Google Sheets: {e}")
+        st.info("💡 Make sure the Google Sheet is set to 'Anyone with the link can view'")
+        
+        # Return sample data as fallback
+        st.warning("⚠️ Using sample data as fallback")
+        return pd.DataFrame({
+            'Ticker': ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK'],
+            'Position': ['LONG', 'LONG', 'SHORT', 'LONG'],
+            'Entry_Price': [1550.00, 3280.00, 1650.00, 970.00],
+            'Quantity': [10, 5, 8, 15],
+            'Stop_Loss': [1500.00, 3200.00, 1720.00, 940.00],
+            'Target_1': [1650.00, 3400.00, 1550.00, 1050.00],
+            'Target_2': [1750.00, 3500.00, 1450.00, 1100.00],
+            'Status': ['ACTIVE', 'ACTIVE', 'ACTIVE', 'ACTIVE']
+        })
 
 # ============================================================================
 # MAIN APP
