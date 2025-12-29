@@ -19,7 +19,9 @@ ALL FEATURES INCLUDED & FIXED:
 ✅ Better caching (FIXED - 15s TTL)
 ================================================================================
 """
-
+"""
+🧠 SMART PORTFOLIO MONITOR v5.2 - COMPLETE FIXED VERSION
+"""
 
 import streamlit as st
 import yfinance as yf
@@ -34,6 +36,7 @@ from email.mime.multipart import MIMEMultipart
 import os
 import json
 import hashlib
+import time
 
 # Try to import streamlit-autorefresh
 try:
@@ -209,7 +212,7 @@ with st.sidebar:
     # ╚═══════════════════════════════════════════════════════════════════════╝
     
     YOUR_EMAIL = "pssundaar@gmail.com"
-    YOUR_APP_PASSWORD = "ibpl ptdp oueh drjr"     # ← PUT YOUR NEW APP PASSWORD HERE!
+    YOUR_APP_PASSWORD = "xxxx xxxx xxxx xxxx"     # ← PUT YOUR NEW APP PASSWORD HERE!
     YOUR_RECIPIENT = "shyamsunderpatri@gmail.com"
     
     # ╔═══════════════════════════════════════════════════════════════════════╗
@@ -508,8 +511,15 @@ def analyze_volume(df):
 
 def find_support_resistance(df, lookback=60):
     """
-    Find key support and resistance levels
-    Returns: dictionary with support/resistance info
+    Find key support and resistance levels using multiple methods.
+    IMPROVED: Uses pivot points, volume profile, and clustering.
+    
+    Args:
+        df: DataFrame with OHLCV data
+        lookback: Number of candles to analyze
+    
+    Returns:
+        dict with support/resistance levels and strength
     """
     if len(df) < lookback:
         lookback = len(df)
@@ -522,83 +532,293 @@ def find_support_resistance(df, lookback=60):
             'nearest_support': current_price * 0.95,
             'nearest_resistance': current_price * 1.05,
             'distance_to_support': 5.0,
-            'distance_to_resistance': 5.0
+            'distance_to_resistance': 5.0,
+            'support_strength': 'WEAK',
+            'resistance_strength': 'WEAK'
         }
     
     high = df['High'].tail(lookback)
     low = df['Low'].tail(lookback)
     close = df['Close'].tail(lookback)
+    volume = df['Volume'].tail(lookback) if 'Volume' in df.columns else None
     current_price = float(close.iloc[-1])
     
-    # Find pivot highs and lows
+    # =========================================================================
+    # METHOD 1: PIVOT POINTS (Traditional)
+    # =========================================================================
     pivot_highs = []
     pivot_lows = []
     
-    for i in range(2, len(high) - 2):
-        # Pivot high (local maximum)
-        if (high.iloc[i] > high.iloc[i-1] and high.iloc[i] > high.iloc[i-2] and 
-            high.iloc[i] > high.iloc[i+1] and high.iloc[i] > high.iloc[i+2]):
-            pivot_highs.append(float(high.iloc[i]))
+    for i in range(3, len(high) - 3):
+        # Pivot high (local maximum with 3 candles on each side)
+        if (high.iloc[i] >= high.iloc[i-1] and high.iloc[i] >= high.iloc[i-2] and 
+            high.iloc[i] >= high.iloc[i-3] and high.iloc[i] >= high.iloc[i+1] and 
+            high.iloc[i] >= high.iloc[i+2] and high.iloc[i] >= high.iloc[i+3]):
+            
+            # Volume confirmation (if available)
+            vol_weight = 1.0
+            if volume is not None and volume.iloc[i] > volume.mean():
+                vol_weight = 1.5  # Higher weight for high volume pivots
+            
+            pivot_highs.append({
+                'price': float(high.iloc[i]),
+                'index': i,
+                'weight': vol_weight
+            })
         
-        # Pivot low (local minimum)
-        if (low.iloc[i] < low.iloc[i-1] and low.iloc[i] < low.iloc[i-2] and 
-            low.iloc[i] < low.iloc[i+1] and low.iloc[i] < low.iloc[i+2]):
-            pivot_lows.append(float(low.iloc[i]))
+        # Pivot low (local minimum with 3 candles on each side)
+        if (low.iloc[i] <= low.iloc[i-1] and low.iloc[i] <= low.iloc[i-2] and 
+            low.iloc[i] <= low.iloc[i-3] and low.iloc[i] <= low.iloc[i+1] and 
+            low.iloc[i] <= low.iloc[i+2] and low.iloc[i] <= low.iloc[i+3]):
+            
+            vol_weight = 1.0
+            if volume is not None and volume.iloc[i] > volume.mean():
+                vol_weight = 1.5
+            
+            pivot_lows.append({
+                'price': float(low.iloc[i]),
+                'index': i,
+                'weight': vol_weight
+            })
     
-    # Cluster nearby levels
-    def cluster_levels(levels, threshold_pct=1.0):
-        if not levels:
+    # =========================================================================
+    # METHOD 2: CLUSTER NEARBY LEVELS
+    # =========================================================================
+    def cluster_levels(pivots, threshold_pct=1.5):
+        """Cluster nearby pivot points and calculate strength."""
+        if not pivots:
             return []
-        levels = sorted(levels)
-        clustered = []
-        current_cluster = [levels[0]]
         
-        for level in levels[1:]:
-            if (level - current_cluster[0]) / current_cluster[0] * 100 < threshold_pct:
-                current_cluster.append(level)
+        # Sort by price
+        sorted_pivots = sorted(pivots, key=lambda x: x['price'])
+        
+        clusters = []
+        current_cluster = [sorted_pivots[0]]
+        
+        for pivot in sorted_pivots[1:]:
+            # If within threshold of cluster center, add to cluster
+            cluster_center = sum(p['price'] for p in current_cluster) / len(current_cluster)
+            if (pivot['price'] - cluster_center) / cluster_center * 100 < threshold_pct:
+                current_cluster.append(pivot)
             else:
-                clustered.append(sum(current_cluster) / len(current_cluster))
-                current_cluster = [level]
-        clustered.append(sum(current_cluster) / len(current_cluster))
-        return clustered
+                # Finalize current cluster
+                avg_price = sum(p['price'] * p['weight'] for p in current_cluster) / sum(p['weight'] for p in current_cluster)
+                total_weight = sum(p['weight'] for p in current_cluster)
+                touch_count = len(current_cluster)
+                
+                clusters.append({
+                    'price': avg_price,
+                    'touches': touch_count,
+                    'weight': total_weight,
+                    'strength': 'STRONG' if touch_count >= 3 else 'MODERATE' if touch_count >= 2 else 'WEAK'
+                })
+                
+                current_cluster = [pivot]
+        
+        # Don't forget last cluster
+        if current_cluster:
+            avg_price = sum(p['price'] * p['weight'] for p in current_cluster) / sum(p['weight'] for p in current_cluster)
+            total_weight = sum(p['weight'] for p in current_cluster)
+            touch_count = len(current_cluster)
+            
+            clusters.append({
+                'price': avg_price,
+                'touches': touch_count,
+                'weight': total_weight,
+                'strength': 'STRONG' if touch_count >= 3 else 'MODERATE' if touch_count >= 2 else 'WEAK'
+            })
+        
+        return clusters
     
-    support_levels = cluster_levels(pivot_lows)
-    resistance_levels = cluster_levels(pivot_highs)
+    support_clusters = cluster_levels(pivot_lows)
+    resistance_clusters = cluster_levels(pivot_highs)
+    
+    # =========================================================================
+    # METHOD 3: FIND NEAREST LEVELS
+    # =========================================================================
     
     # Find nearest support (below current price)
-    supports_below = [s for s in support_levels if s < current_price]
-    nearest_support = max(supports_below) if supports_below else current_price * 0.95
+    supports_below = [s for s in support_clusters if s['price'] < current_price]
+    if supports_below:
+        # Get the highest support below current price
+        nearest_support_data = max(supports_below, key=lambda x: x['price'])
+        nearest_support = nearest_support_data['price']
+        support_strength = nearest_support_data['strength']
+        support_touches = nearest_support_data['touches']
+    else:
+        # No pivot support found, use recent low
+        nearest_support = float(low.min()) * 0.99
+        support_strength = 'WEAK'
+        support_touches = 0
     
     # Find nearest resistance (above current price)
-    resistances_above = [r for r in resistance_levels if r > current_price]
-    nearest_resistance = min(resistances_above) if resistances_above else current_price * 1.05
+    resistances_above = [r for r in resistance_clusters if r['price'] > current_price]
+    if resistances_above:
+        # Get the lowest resistance above current price
+        nearest_resistance_data = min(resistances_above, key=lambda x: x['price'])
+        nearest_resistance = nearest_resistance_data['price']
+        resistance_strength = nearest_resistance_data['strength']
+        resistance_touches = nearest_resistance_data['touches']
+    else:
+        # No pivot resistance found, use recent high
+        nearest_resistance = float(high.max()) * 1.01
+        resistance_strength = 'WEAK'
+        resistance_touches = 0
+    
+    # =========================================================================
+    # METHOD 4: ADD PSYCHOLOGICAL LEVELS (Round Numbers)
+    # =========================================================================
+    
+    # Find round number levels near current price
+    def find_round_numbers(price, range_pct=5):
+        """Find significant round numbers within range of price."""
+        levels = []
+        
+        # Determine the magnitude
+        magnitude = 10 ** (len(str(int(price))) - 2)  # For 1500, magnitude = 10
+        
+        # Round numbers
+        base = int(price / magnitude) * magnitude
+        for offset in range(-3, 4):
+            level = base + (offset * magnitude)
+            if abs(level - price) / price * 100 < range_pct:
+                levels.append(level)
+        
+        # Half levels (e.g., 1450, 1550 for a stock around 1500)
+        half_magnitude = magnitude / 2
+        for offset in range(-5, 6):
+            level = base + (offset * half_magnitude)
+            if abs(level - price) / price * 100 < range_pct:
+                if level not in levels:
+                    levels.append(level)
+        
+        return sorted(levels)
+    
+    psychological_levels = find_round_numbers(current_price)
+    
+    # Enhance support/resistance with psychological levels
+    for level in psychological_levels:
+        if level < current_price and level > nearest_support:
+            # This psychological level is closer than pivot support
+            if (current_price - level) / current_price * 100 < 2:  # Within 2%
+                nearest_support = level
+                support_strength = 'MODERATE'
+        elif level > current_price and level < nearest_resistance:
+            if (level - current_price) / current_price * 100 < 2:
+                nearest_resistance = level
+                resistance_strength = 'MODERATE'
+    
+    # Calculate distances
+    distance_to_support = ((current_price - nearest_support) / current_price) * 100
+    distance_to_resistance = ((nearest_resistance - current_price) / current_price) * 100
     
     return {
-        'support_levels': support_levels[-5:] if support_levels else [],
-        'resistance_levels': resistance_levels[-5:] if resistance_levels else [],
+        'support_levels': [s['price'] for s in support_clusters[-5:]],
+        'resistance_levels': [r['price'] for r in resistance_clusters[-5:]],
         'nearest_support': nearest_support,
         'nearest_resistance': nearest_resistance,
-        'distance_to_support': ((current_price - nearest_support) / current_price) * 100,
-        'distance_to_resistance': ((nearest_resistance - current_price) / current_price) * 100
+        'distance_to_support': distance_to_support,
+        'distance_to_resistance': distance_to_resistance,
+        'support_strength': support_strength,
+        'resistance_strength': resistance_strength,
+        'support_touches': support_touches,
+        'resistance_touches': resistance_touches,
+        'psychological_levels': psychological_levels
     }
+# ============================================================================
+# RATE LIMITING FOR API CALLS
+# ============================================================================
+import time
 
+# Global rate limiter
+if 'last_api_call' not in st.session_state:
+    st.session_state.last_api_call = {}
+if 'api_call_count' not in st.session_state:
+    st.session_state.api_call_count = 0
+
+def rate_limited_api_call(ticker, min_interval=2.0):
+    """
+    Ensure minimum interval between API calls for same ticker.
+    Prevents Yahoo Finance from blocking us.
+    
+    Args:
+        ticker: Stock ticker symbol
+        min_interval: Minimum seconds between calls (default 2 seconds)
+    
+    Returns:
+        True if can proceed, False if should wait
+    """
+    current_time = time.time()
+    
+    # Check if we called this ticker recently
+    if ticker in st.session_state.last_api_call:
+        elapsed = current_time - st.session_state.last_api_call[ticker]
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)  # Wait remaining time
+    
+    # Update last call time
+    st.session_state.last_api_call[ticker] = time.time()
+    st.session_state.api_call_count += 1
+    
+    return True
+
+def get_stock_data_safe(ticker, period="6mo"):
+    """
+    Safely fetch stock data with rate limiting and error handling.
+    
+    Args:
+        ticker: Stock ticker (e.g., 'RELIANCE' or 'RELIANCE.NS')
+        period: Data period (default '6mo')
+    
+    Returns:
+        DataFrame with stock data or None if failed
+    """
+    # Ensure .NS suffix for NSE stocks
+    symbol = ticker if '.NS' in str(ticker) or '.BO' in str(ticker) else f"{ticker}.NS"
+    
+    # Apply rate limiting
+    rate_limited_api_call(symbol)
+    
+    try:
+        stock = yf.Ticker(symbol)
+        df = stock.history(period=period)
+        
+        if df.empty:
+            # Try BSE if NSE fails
+            symbol = symbol.replace('.NS', '.BO')
+            rate_limited_api_call(symbol)
+            stock = yf.Ticker(symbol)
+            df = stock.history(period=period)
+        
+        if df.empty:
+            return None
+        
+        df.reset_index(inplace=True)
+        return df
+        
+    except Exception as e:
+        log_email(f"API Error for {ticker}: {str(e)}")
+        return None
 # ============================================================================
 # MULTI-TIMEFRAME ANALYSIS ✅ (NEW - FULLY IMPLEMENTED)
 # ============================================================================
 
 def multi_timeframe_analysis(ticker, position_type):
     """
-    Analyze multiple timeframes for trend confirmation
-    Returns: signals dict, alignment_score, recommendation
+    Analyze multiple timeframes with rate limiting.
+    IMPROVED: Uses cached data and smart interval selection.
     """
     symbol = ticker if '.NS' in str(ticker) else f"{ticker}.NS"
     
     try:
+        # Rate limit the API call
+        rate_limited_api_call(symbol)
+        
         stock = yf.Ticker(symbol)
         
         timeframes = {}
         
-        # Daily timeframe (3 months)
+        # Daily (primary timeframe - always fetch)
         try:
             daily_df = stock.history(period="3mo", interval="1d")
             if len(daily_df) >= 20:
@@ -606,7 +826,10 @@ def multi_timeframe_analysis(ticker, position_type):
         except:
             pass
         
-        # Weekly timeframe (1 year)
+        # Add small delay between calls
+        time.sleep(0.5)
+        
+        # Weekly (secondary)
         try:
             weekly_df = stock.history(period="1y", interval="1wk")
             if len(weekly_df) >= 10:
@@ -614,16 +837,28 @@ def multi_timeframe_analysis(ticker, position_type):
         except:
             pass
         
-        # Hourly timeframe (5 days) - only during market hours
-        try:
-            hourly_df = stock.history(period="5d", interval="1h")
-            if len(hourly_df) >= 10:
-                timeframes['Hourly'] = hourly_df
-        except:
-            pass
+        # Hourly (only during market hours to avoid stale data)
+        is_open, _, _, _ = is_market_hours()
+        if is_open:
+            time.sleep(0.5)
+            try:
+                hourly_df = stock.history(period="5d", interval="1h")
+                if len(hourly_df) >= 10:
+                    timeframes['Hourly'] = hourly_df
+            except:
+                pass
         
         if not timeframes:
-            return {}, 50, "Unable to fetch multi-timeframe data"
+            return {
+                'signals': {},
+                'details': {},
+                'alignment_score': 50,
+                'recommendation': "Unable to fetch data",
+                'aligned_count': 0,
+                'against_count': 0,
+                'total_timeframes': 0,
+                'trend_strength': 'UNKNOWN'
+            }
         
         signals = {}
         details = {}
@@ -635,44 +870,41 @@ def multi_timeframe_analysis(ticker, position_type):
                 
                 # Calculate indicators
                 rsi = calculate_rsi(close).iloc[-1]
+                if pd.isna(rsi):
+                    rsi = 50
+                
                 sma_20 = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else close.mean()
                 ema_9 = close.ewm(span=9).mean().iloc[-1]
+                ema_21 = close.ewm(span=21).mean().iloc[-1] if len(close) >= 21 else close.mean()
                 
-                # MACD
                 macd, signal_line, histogram = calculate_macd(close)
                 macd_hist = histogram.iloc[-1] if len(histogram) > 0 else 0
+                if pd.isna(macd_hist):
+                    macd_hist = 0
                 
-                # Trend determination
-                bullish_count = 0
-                bearish_count = 0
+                # Scoring
+                bullish_points = 0
+                total_points = 8
                 
-                if rsi > 50:
-                    bullish_count += 1
-                else:
-                    bearish_count += 1
+                if rsi > 50: bullish_points += 2
+                if current > sma_20: bullish_points += 2
+                if ema_9 > ema_21: bullish_points += 2
+                if macd_hist > 0: bullish_points += 2
                 
-                if current > sma_20:
-                    bullish_count += 1
-                else:
-                    bearish_count += 1
+                bullish_pct = (bullish_points / total_points) * 100
                 
-                if current > ema_9:
-                    bullish_count += 1
-                else:
-                    bearish_count += 1
-                
-                if macd_hist > 0:
-                    bullish_count += 1
-                else:
-                    bearish_count += 1
-                
-                # Determine signal
-                if bullish_count >= 3:
+                if bullish_pct >= 75:
                     signal = "BULLISH"
-                    strength = "Strong" if bullish_count == 4 else "Moderate"
-                elif bearish_count >= 3:
+                    strength = "Strong"
+                elif bullish_pct >= 50:
+                    signal = "BULLISH"
+                    strength = "Moderate"
+                elif bullish_pct <= 25:
                     signal = "BEARISH"
-                    strength = "Strong" if bearish_count == 4 else "Moderate"
+                    strength = "Strong"
+                elif bullish_pct < 50:
+                    signal = "BEARISH"
+                    strength = "Moderate"
                 else:
                     signal = "NEUTRAL"
                     strength = "Weak"
@@ -683,33 +915,31 @@ def multi_timeframe_analysis(ticker, position_type):
                     'strength': strength,
                     'rsi': rsi,
                     'above_sma20': current > sma_20,
-                    'above_ema9': current > ema_9,
-                    'macd_bullish': macd_hist > 0
+                    'ema_bullish': ema_9 > ema_21,
+                    'macd_bullish': macd_hist > 0,
+                    'bullish_score': bullish_pct
                 }
         
-        # Calculate alignment score
+        # Calculate alignment
         if position_type == "LONG":
             aligned = sum(1 for s in signals.values() if s == "BULLISH")
             against = sum(1 for s in signals.values() if s == "BEARISH")
-        else:  # SHORT
+        else:
             aligned = sum(1 for s in signals.values() if s == "BEARISH")
             against = sum(1 for s in signals.values() if s == "BULLISH")
         
         total = len(signals)
-        if total > 0:
-            alignment_score = int((aligned / total) * 100)
-        else:
-            alignment_score = 50
+        alignment_score = int((aligned / total) * 100) if total > 0 else 50
         
-        # Generate recommendation
+        # Recommendation
         if alignment_score >= 80:
-            recommendation = f"✅ All timeframes aligned with {position_type}"
+            recommendation = f"✅ Strong alignment with {position_type}"
         elif alignment_score >= 60:
-            recommendation = f"👍 Most timeframes support {position_type}"
+            recommendation = f"👍 Good alignment with {position_type}"
         elif alignment_score >= 40:
-            recommendation = f"⚠️ Mixed signals across timeframes"
+            recommendation = f"⚠️ Mixed signals"
         else:
-            recommendation = f"🚨 Timeframes against {position_type} position"
+            recommendation = f"🚨 Against {position_type}"
         
         return {
             'signals': signals,
@@ -718,7 +948,8 @@ def multi_timeframe_analysis(ticker, position_type):
             'recommendation': recommendation,
             'aligned_count': aligned,
             'against_count': against,
-            'total_timeframes': total
+            'total_timeframes': total,
+            'trend_strength': 'STRONG' if alignment_score >= 70 else 'MODERATE' if alignment_score >= 50 else 'WEAK'
         }
         
     except Exception as e:
@@ -729,9 +960,9 @@ def multi_timeframe_analysis(ticker, position_type):
             'recommendation': f"Error: {str(e)}",
             'aligned_count': 0,
             'against_count': 0,
-            'total_timeframes': 0
+            'total_timeframes': 0,
+            'trend_strength': 'UNKNOWN'
         }
-
 # ============================================================================
 # MOMENTUM SCORING (0-100) ✅
 # ============================================================================
@@ -1141,107 +1372,224 @@ def predict_upside_potential(df, current_price, target1, target2, position_type)
 # DYNAMIC TARGET & TRAIL STOP CALCULATION ✅
 # ============================================================================
 
-def calculate_dynamic_levels(df, entry_price, current_price, stop_loss, position_type, pnl_percent, trail_trigger=3.0):
+def calculate_dynamic_levels(df, entry_price, current_price, stop_loss, position_type, 
+                             pnl_percent, trail_trigger=2.0):
     """
-    Calculate dynamic targets and trailing stop loss
-    Uses trail_trigger from sidebar settings
+    Calculate dynamic targets and trailing stop loss.
+    IMPROVED: Uses ATR-based dynamic trailing instead of fixed percentages.
+    
+    Args:
+        df: DataFrame with OHLCV data
+        entry_price: Your entry price
+        current_price: Current market price
+        stop_loss: Your original stop loss
+        position_type: 'LONG' or 'SHORT'
+        pnl_percent: Current P&L percentage
+        trail_trigger: Profit % to start trailing (from sidebar)
+    
+    Returns:
+        dict with trail_stop, should_trail, targets, etc.
     """
     close = df['Close']
-    atr = calculate_atr(df['High'], df['Low'], close).iloc[-1]
+    high = df['High']
+    low = df['Low']
     
-    if pd.isna(atr):
-        atr = current_price * 0.02  # Default 2%
+    # Calculate ATR (Average True Range)
+    atr = calculate_atr(high, low, close).iloc[-1]
+    if pd.isna(atr) or atr <= 0:
+        atr = current_price * 0.02  # Default 2% of price
     
+    # ATR as percentage of price
+    atr_pct = (atr / current_price) * 100
+    
+    # Get support/resistance levels
     sr_levels = find_support_resistance(df)
     
     result = {
         'atr': atr,
+        'atr_pct': atr_pct,
         'support': sr_levels['nearest_support'],
-        'resistance': sr_levels['nearest_resistance']
+        'resistance': sr_levels['nearest_resistance'],
+        'support_strength': sr_levels.get('support_strength', 'UNKNOWN'),
+        'resistance_strength': sr_levels.get('resistance_strength', 'UNKNOWN')
     }
     
+    # =========================================================================
+    # DYNAMIC TRAIL STOP CALCULATION
+    # =========================================================================
+    
     if position_type == "LONG":
-        # Dynamic targets
+        # Calculate dynamic targets based on ATR
         result['target1'] = current_price + (atr * 1.5)
         result['target2'] = current_price + (atr * 3)
         result['target3'] = min(current_price + (atr * 5), sr_levels['nearest_resistance'])
         
-        # Trail stop based on profit level - Using dynamic threshold
-        if pnl_percent >= trail_trigger * 3:  # e.g., 6% if trigger is 2%
-            result['trail_stop'] = max(entry_price * 1.05, current_price - atr)  # Lock 5% profit
-            result['trail_reason'] = f"Locking 5% profit (P&L: {pnl_percent:.1f}%)"
+        # =====================================================================
+        # IMPROVED TRAIL STOP LOGIC
+        # =====================================================================
+        
+        # Calculate the "risk" we took (entry - original SL)
+        original_risk = entry_price - stop_loss
+        
+        # Dynamic trail based on profit level AND volatility (ATR)
+        if pnl_percent >= trail_trigger * 5:  # e.g., 10% profit if trigger is 2%
+            # Massive profit - lock most of it
+            # Trail at 1x ATR below current price, but minimum 70% of profit locked
+            atr_trail = current_price - (atr * 1.0)
+            pct_trail = entry_price + (current_price - entry_price) * 0.70  # Lock 70%
+            result['trail_stop'] = max(atr_trail, pct_trail)
+            result['trail_reason'] = f"Locking 70%+ profit (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "LOCK_MAJOR_PROFIT"
+            
+        elif pnl_percent >= trail_trigger * 4:  # e.g., 8% if trigger is 2%
+            # Large profit - lock 60%
+            atr_trail = current_price - (atr * 1.2)
+            pct_trail = entry_price + (current_price - entry_price) * 0.60
+            result['trail_stop'] = max(atr_trail, pct_trail)
+            result['trail_reason'] = f"Locking 60% profit (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "LOCK_PROFITS"
+            
+        elif pnl_percent >= trail_trigger * 3:  # e.g., 6% if trigger is 2%
+            # Good profit - lock 50%
+            atr_trail = current_price - (atr * 1.5)
+            pct_trail = entry_price + (current_price - entry_price) * 0.50
+            result['trail_stop'] = max(atr_trail, pct_trail)
+            result['trail_reason'] = f"Locking 50% profit (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "SECURE_GAINS"
+            
         elif pnl_percent >= trail_trigger * 2:  # e.g., 4% if trigger is 2%
-            result['trail_stop'] = max(entry_price * 1.02, current_price - (atr * 1.5))  # Lock 2%
-            result['trail_reason'] = f"Locking 2% profit (P&L: {pnl_percent:.1f}%)"
-        elif pnl_percent >= trail_trigger:  # e.g., 2%
-            result['trail_stop'] = max(entry_price, current_price - (atr * 2))  # Breakeven
+            # Moderate profit - lock 30% or move to cost + small profit
+            atr_trail = current_price - (atr * 2.0)
+            pct_trail = entry_price + (current_price - entry_price) * 0.30
+            result['trail_stop'] = max(atr_trail, pct_trail, entry_price * 1.005)  # At least 0.5% profit
+            result['trail_reason'] = f"Securing gains (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "SECURE_GAINS"
+            
+        elif pnl_percent >= trail_trigger:  # e.g., 2% if trigger is 2%
+            # Just hit trail trigger - move to breakeven
+            atr_trail = current_price - (atr * 2.5)
+            result['trail_stop'] = max(atr_trail, entry_price)  # At least breakeven
             result['trail_reason'] = f"Moving to breakeven (P&L: {pnl_percent:.1f}%)"
-        elif pnl_percent >= trail_trigger * 0.5:  # e.g., 1%
-            result['trail_stop'] = max(stop_loss, current_price - (atr * 2.5))
-            result['trail_reason'] = f"Tightening SL (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "BREAKEVEN"
+            
+        elif pnl_percent >= trail_trigger * 0.5:  # e.g., 1% if trigger is 2%
+            # Small profit - tighten SL but don't go above entry
+            atr_trail = current_price - (atr * 3.0)
+            result['trail_stop'] = max(atr_trail, stop_loss)  # Don't go above entry yet
+            if result['trail_stop'] > stop_loss:
+                result['trail_reason'] = f"Tightening SL (P&L: {pnl_percent:.1f}%)"
+                result['trail_action'] = "TIGHTEN"
+            else:
+                result['trail_reason'] = "Keep original SL"
+                result['trail_action'] = "HOLD"
+                
         else:
+            # No significant profit yet
             result['trail_stop'] = stop_loss
-            result['trail_reason'] = "Keep original SL"
+            result['trail_reason'] = "Keep original SL - profit not enough to trail"
+            result['trail_action'] = "HOLD"
         
+        # Ensure trail stop is not below original SL
+        result['trail_stop'] = max(result['trail_stop'], stop_loss)
         result['should_trail'] = result['trail_stop'] > stop_loss
+        result['trail_improvement'] = result['trail_stop'] - stop_loss if result['should_trail'] else 0
+        result['trail_improvement_pct'] = (result['trail_improvement'] / entry_price * 100) if result['should_trail'] else 0
         
-    else:  # SHORT
+    else:  # SHORT position
+        # Dynamic targets for SHORT
         result['target1'] = current_price - (atr * 1.5)
         result['target2'] = current_price - (atr * 3)
         result['target3'] = max(current_price - (atr * 5), sr_levels['nearest_support'])
         
-        if pnl_percent >= trail_trigger * 3:
-            result['trail_stop'] = min(entry_price * 0.95, current_price + atr)
-            result['trail_reason'] = f"Locking 5% profit (P&L: {pnl_percent:.1f}%)"
+        # Calculate original risk for SHORT
+        original_risk = stop_loss - entry_price
+        
+        # Dynamic trail for SHORT (mirror of LONG logic)
+        if pnl_percent >= trail_trigger * 5:
+            atr_trail = current_price + (atr * 1.0)
+            pct_trail = entry_price - (entry_price - current_price) * 0.70
+            result['trail_stop'] = min(atr_trail, pct_trail)
+            result['trail_reason'] = f"Locking 70%+ profit (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "LOCK_MAJOR_PROFIT"
+            
+        elif pnl_percent >= trail_trigger * 4:
+            atr_trail = current_price + (atr * 1.2)
+            pct_trail = entry_price - (entry_price - current_price) * 0.60
+            result['trail_stop'] = min(atr_trail, pct_trail)
+            result['trail_reason'] = f"Locking 60% profit (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "LOCK_PROFITS"
+            
+        elif pnl_percent >= trail_trigger * 3:
+            atr_trail = current_price + (atr * 1.5)
+            pct_trail = entry_price - (entry_price - current_price) * 0.50
+            result['trail_stop'] = min(atr_trail, pct_trail)
+            result['trail_reason'] = f"Locking 50% profit (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "SECURE_GAINS"
+            
         elif pnl_percent >= trail_trigger * 2:
-            result['trail_stop'] = min(entry_price * 0.98, current_price + (atr * 1.5))
-            result['trail_reason'] = f"Locking 2% profit (P&L: {pnl_percent:.1f}%)"
+            atr_trail = current_price + (atr * 2.0)
+            pct_trail = entry_price - (entry_price - current_price) * 0.30
+            result['trail_stop'] = min(atr_trail, pct_trail, entry_price * 0.995)
+            result['trail_reason'] = f"Securing gains (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "SECURE_GAINS"
+            
         elif pnl_percent >= trail_trigger:
-            result['trail_stop'] = min(entry_price, current_price + (atr * 2))
+            atr_trail = current_price + (atr * 2.5)
+            result['trail_stop'] = min(atr_trail, entry_price)
             result['trail_reason'] = f"Moving to breakeven (P&L: {pnl_percent:.1f}%)"
+            result['trail_action'] = "BREAKEVEN"
+            
         elif pnl_percent >= trail_trigger * 0.5:
-            result['trail_stop'] = min(stop_loss, current_price + (atr * 2.5))
-            result['trail_reason'] = f"Tightening SL (P&L: {pnl_percent:.1f}%)"
+            atr_trail = current_price + (atr * 3.0)
+            result['trail_stop'] = min(atr_trail, stop_loss)
+            if result['trail_stop'] < stop_loss:
+                result['trail_reason'] = f"Tightening SL (P&L: {pnl_percent:.1f}%)"
+                result['trail_action'] = "TIGHTEN"
+            else:
+                result['trail_reason'] = "Keep original SL"
+                result['trail_action'] = "HOLD"
         else:
             result['trail_stop'] = stop_loss
-            result['trail_reason'] = "Keep original SL"
+            result['trail_reason'] = "Keep original SL - profit not enough to trail"
+            result['trail_action'] = "HOLD"
         
+        # Ensure trail stop is not above original SL for SHORT
+        result['trail_stop'] = min(result['trail_stop'], stop_loss)
         result['should_trail'] = result['trail_stop'] < stop_loss
+        result['trail_improvement'] = stop_loss - result['trail_stop'] if result['should_trail'] else 0
+        result['trail_improvement_pct'] = (result['trail_improvement'] / entry_price * 100) if result['should_trail'] else 0
     
     return result
-
 # ============================================================================
 # COMPLETE SMART ANALYSIS ✅ (UPDATED WITH ALL PARAMETERS)
 # ============================================================================
 
-@st.cache_data(ttl=15)  # FIXED: 15 second cache (less than refresh interval)
-def smart_analyze_position(ticker, position_type, entry_price, quantity, stop_loss, 
-                          target1, target2, trail_threshold=2.0, sl_alert_threshold=50,
-                          enable_mtf=True):
+@st.cache_data(ttl=90)  # FIXED: 15 second cache (less than refresh interval)
+def smart_analyze_position(ticker, position_type, entry_price, quantity, stop_loss,
+                           target1, target2, trail_threshold=2.0, sl_alert_threshold=50,
+                           sl_approach_threshold=2.0, enable_mtf=True):
     """
     Complete smart analysis with all features
     Now accepts sidebar parameters for dynamic thresholds
     """
-    symbol = ticker if '.NS' in str(ticker) else f"{ticker}.NS"
+    df = get_stock_data_safe(ticker, period="6mo")
+    if df is None or df.empty:
+        return None
     
-    # Fetch data
     try:
-        stock = yf.Ticker(symbol)
-        df = stock.history(period="6mo")
-        
-        if df.empty:
-            symbol = symbol.replace('.NS', '.BO')
-            stock = yf.Ticker(symbol)
-            df = stock.history(period="6mo")
-        
-        if df.empty:
-            return None
-        
-        df.reset_index(inplace=True)
         current_price = float(df['Close'].iloc[-1])
+        prev_close = float(df['Close'].iloc[-2]) if len(df) > 1 else current_price
+        day_change = ((current_price - prev_close) / prev_close) * 100
+        
+        # Get day's high and low
+        day_high = float(df['High'].iloc[-1])
+        day_low = float(df['Low'].iloc[-1])
         
     except Exception as e:
         return None
+    
+    
+    
     
     # Basic P&L
     if position_type == "LONG":
@@ -2119,6 +2467,9 @@ def main():
             st.caption(f"⏸️ Auto-refresh paused - {market_status}: {market_msg}")
     else:
         st.caption("🔄 Auto-refresh disabled. Click 'Refresh' button to update.")
+
+
+        
 
 # ============================================================================
 # RUN
