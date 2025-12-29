@@ -19,9 +19,7 @@ ALL FEATURES INCLUDED & FIXED:
 ✅ Better caching (FIXED - 15s TTL)
 ================================================================================
 """
-"""
-🧠 SMART PORTFOLIO MONITOR v5.2 - COMPLETE FIXED VERSION
-"""
+
 
 import streamlit as st
 import yfinance as yf
