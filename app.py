@@ -212,7 +212,7 @@ with st.sidebar:
     # ╚═══════════════════════════════════════════════════════════════════════╝
     
     YOUR_EMAIL = "pssundaar@gmail.com"
-    YOUR_APP_PASSWORD = "xxxx xxxx xxxx xxxx"     # ← PUT YOUR NEW APP PASSWORD HERE!
+    YOUR_APP_PASSWORD = "ibpl ptdp oueh drjr"     # ← PUT YOUR NEW APP PASSWORD HERE!
     YOUR_RECIPIENT = "shyamsunderpatri@gmail.com"
     
     # ╔═══════════════════════════════════════════════════════════════════════╗
