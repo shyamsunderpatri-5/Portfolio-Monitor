@@ -481,6 +481,102 @@ def get_tax_implication(holding_days, pnl):
 # ============================================================================
 # ENTRY TRIGGER CHECK (CORRECT LOGIC)
 # ============================================================================
+def parse_date_robust(date_input):
+    """
+    Robustly parse date from various formats.
+    Handles Excel dates, string dates, timestamps with timezone.
+    
+    Returns:
+        datetime object or None if parsing fails
+    """
+    if date_input is None:
+        return None
+    
+    # Already a datetime
+    if isinstance(date_input, datetime):
+        # Remove timezone info for comparison
+        if date_input.tzinfo is not None:
+            return date_input.replace(tzinfo=None)
+        return date_input
+    
+    # Pandas Timestamp
+    if hasattr(date_input, 'to_pydatetime'):
+        try:
+            dt = date_input.to_pydatetime()
+            if dt.tzinfo is not None:
+                return dt.replace(tzinfo=None)
+            return dt
+        except:
+            pass
+    
+    # String date
+    if isinstance(date_input, str):
+        date_str = date_input.strip()
+        
+        # Remove timezone info from string if present
+        # Handle "2025-12-23 00:00:00+05:30" format
+        if '+' in date_str:
+            date_str = date_str.split('+')[0].strip()
+        if '-' in date_str and ':' in date_str and len(date_str) > 19:
+            # Has timezone offset like "-05:30"
+            date_str = date_str[:19]
+        
+        # Try multiple date formats (DD-MM-YYYY first for Indian format)
+        formats_to_try = [
+            # Indian formats (DD-MM-YYYY) - TRY FIRST
+            "%d-%m-%Y",
+            "%d/%m/%Y",
+            "%d-%m-%y",
+            "%d/%m/%y",
+            
+            # ISO formats (YYYY-MM-DD)
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            
+            # With time
+            "%d-%m-%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            
+            # Other formats
+            "%d-%b-%Y",
+            "%d %b %Y",
+            "%d %B %Y",
+            "%b %d, %Y",
+            "%B %d, %Y",
+        ]
+        
+        for fmt in formats_to_try:
+            try:
+                parsed = datetime.strptime(date_str, fmt)
+                return parsed
+            except ValueError:
+                continue
+        
+        # Try pandas as last resort
+        try:
+            parsed = pd.to_datetime(date_str, dayfirst=True)  # dayfirst=True for DD-MM-YYYY
+            if hasattr(parsed, 'to_pydatetime'):
+                dt = parsed.to_pydatetime()
+                if dt.tzinfo is not None:
+                    return dt.replace(tzinfo=None)
+                return dt
+            return parsed
+        except:
+            pass
+    
+    # Numeric (Excel date serial number)
+    if isinstance(date_input, (int, float)):
+        try:
+            # Excel date serial number (days since 1900-01-01)
+            from datetime import timedelta
+            excel_epoch = datetime(1899, 12, 30)  # Excel epoch
+            return excel_epoch + timedelta(days=int(date_input))
+        except:
+            pass
+    
+    return None
 # ============================================================================
 # ENTRY TRIGGER CHECK (FIXED VERSION)
 # ============================================================================
