@@ -474,25 +474,33 @@ def get_tax_implication(holding_days, pnl):
 # ENTRY TRIGGER CHECK (CORRECTED VERSION)
 # ============================================================================
 
+# ============================================================================
+# ENTRY TRIGGER CHECK (CORRECT LOGIC)
+# ============================================================================
+
+# ============================================================================
+# ENTRY TRIGGER CHECK (CORRECT LOGIC)
+# ============================================================================
+
 def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, check_period="5d"):
     """
     Check if entry price was triggered (hit) during the check period.
     
-    LOGIC (Breakout/Breakdown Style):
-    - For LONG: Entry triggers when day_high >= entry_price (price reached UP to entry)
-    - For SHORT: Entry triggers when day_low <= entry_price (price reached DOWN to entry)
-    
-    This assumes you're waiting for price to REACH your entry level.
+    ✅ CORRECT LOGIC:
+    - For LONG: Entry triggers when day_high >= entry_price 
+      (Price went UP to reach your buy level)
+    - For SHORT: Entry triggers when day_low <= entry_price 
+      (Price went DOWN to reach your short level)
     
     Args:
-        ticker: Stock symbol (e.g., 'RELIANCE', 'TCS')
+        ticker: Stock symbol
         entry_price: Your entry price level
         position_type: "LONG" or "SHORT"
-        entry_date: Optional - if provided and in past, assumes already triggered
+        entry_date: Optional - if in past, assumes already triggered
         check_period: How far back to check (default: 5 days)
     
     Returns:
-        dict with trigger status, trigger_date, high, low, current_price
+        dict with trigger status
     """
     
     # Error response template
@@ -506,7 +514,7 @@ def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, c
         'day_low': None,
         'current_price': None,
         'distance_to_entry': None,
-        'distance_from_low': None
+        'gap_to_entry': None
     }
     
     # =========================================================================
@@ -516,7 +524,6 @@ def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, c
         try:
             holding_days = calculate_holding_period(entry_date)
             if holding_days > 0:
-                # Entry date is in the past - position was already taken
                 return {
                     'triggered': True,
                     'status': 'TRIGGERED',
@@ -527,10 +534,10 @@ def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, c
                     'day_low': None,
                     'current_price': None,
                     'distance_to_entry': 0,
-                    'distance_from_low': 0
+                    'gap_to_entry': 0
                 }
         except Exception:
-            pass  # Continue with price-based check
+            pass
     
     # =========================================================================
     # STEP 2: Get historical price data
@@ -541,14 +548,12 @@ def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, c
         return error_response
     
     try:
-        # Ensure Date column exists
         if 'Date' not in df.columns:
             if df.index.name == 'Date':
                 df = df.reset_index()
             else:
                 df['Date'] = df.index
         
-        # Get current/today's prices
         current_price = float(df['Close'].iloc[-1])
         today_high = float(df['High'].iloc[-1])
         today_low = float(df['Low'].iloc[-1])
@@ -568,24 +573,23 @@ def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, c
             day_low = float(df['Low'].iloc[idx])
             day_high = float(df['High'].iloc[idx])
             
-            # Get date safely
             if 'Date' in df.columns:
                 row_date = df['Date'].iloc[idx]
             else:
                 row_date = df.index[idx]
             
-            # ✅ BREAKOUT/BREAKDOWN LOGIC
+            # ✅ CORRECT LOGIC
             if position_type == "LONG":
-                # For LONG: Price must go HIGH enough to reach entry level
-                # Example: Entry at 3816.6, need high >= 3816.6
+                # LONG: Waiting for price to GO UP to entry level
+                # Trigger when day's HIGH reaches or exceeds entry price
                 if day_high >= entry_price:
                     triggered = True
                     trigger_date = row_date
                     break
                     
             else:  # SHORT
-                # For SHORT: Price must go LOW enough to reach entry level
-                # Example: Entry at 100, need low <= 100
+                # SHORT: Waiting for price to GO DOWN to entry level
+                # Trigger when day's LOW reaches or goes below entry price
                 if day_low <= entry_price:
                     triggered = True
                     trigger_date = row_date
@@ -595,19 +599,18 @@ def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, c
             continue
     
     # =========================================================================
-    # STEP 4: Calculate distances
+    # STEP 4: Calculate gap to entry
     # =========================================================================
     if position_type == "LONG":
-        # How far is current price from entry?
+        # For LONG: How far is today's high from entry?
+        gap_to_entry = entry_price - today_high  # Positive = need to go up more
+        gap_pct = (gap_to_entry / entry_price) * 100
         distance_to_entry = ((current_price - entry_price) / entry_price) * 100
-        # How far was today's high from entry?
-        distance_from_high = ((today_high - entry_price) / entry_price) * 100
-        # Gap to entry (positive = need to go up more)
-        gap_to_entry = entry_price - today_high
     else:
+        # For SHORT: How far is today's low from entry?
+        gap_to_entry = today_low - entry_price  # Positive = need to go down more
+        gap_pct = (gap_to_entry / entry_price) * 100
         distance_to_entry = ((entry_price - current_price) / entry_price) * 100
-        distance_from_low = ((entry_price - today_low) / entry_price) * 100
-        gap_to_entry = today_low - entry_price
     
     # =========================================================================
     # STEP 5: Determine status and message
@@ -618,38 +621,40 @@ def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, c
         message = f"Entry triggered on {trigger_date}"
     else:
         if position_type == "LONG":
-            gap = entry_price - today_high
-            gap_pct = (gap / entry_price) * 100
-            
-            if gap <= 0:
-                # Should have triggered but didn't - data issue
+            if gap_to_entry <= 0:
+                # High >= Entry, should be triggered
                 status = "TRIGGERED"
                 status_icon = "✅"
-                message = f"Entry reached! High: ₹{today_high:.2f} >= Entry: ₹{entry_price:.2f}"
+                message = f"Entry reached! High ₹{today_high:.2f} >= Entry ₹{entry_price:.2f}"
             elif gap_pct <= 0.5:  # Within 0.5%
                 status = "ALMOST"
                 status_icon = "🟡"
-                message = f"Very close! High: ₹{today_high:.2f} vs Entry: ₹{entry_price:.2f} (gap: ₹{gap:.2f})"
+                message = f"Almost! High ₹{today_high:.2f} vs Entry ₹{entry_price:.2f} (gap: ₹{gap_to_entry:.2f})"
+            elif gap_pct <= 2.0:  # Within 2%
+                status = "CLOSE"
+                status_icon = "🟠"
+                message = f"Close! High ₹{today_high:.2f} needs ₹{gap_to_entry:.2f} more to reach ₹{entry_price:.2f}"
             else:
                 status = "PENDING"
                 status_icon = "⏳"
-                message = f"Waiting. High: ₹{today_high:.2f} needs to reach ₹{entry_price:.2f} (gap: ₹{gap:.2f})"
+                message = f"Waiting. High ₹{today_high:.2f} needs to reach ₹{entry_price:.2f} (gap: ₹{gap_to_entry:.2f})"
         else:  # SHORT
-            gap = today_low - entry_price
-            gap_pct = (gap / entry_price) * 100
-            
-            if gap <= 0:
+            if gap_to_entry <= 0:
                 status = "TRIGGERED"
                 status_icon = "✅"
-                message = f"Entry reached! Low: ₹{today_low:.2f} <= Entry: ₹{entry_price:.2f}"
-            elif gap_pct <= 0.5:
+                message = f"Entry reached! Low ₹{today_low:.2f} <= Entry ₹{entry_price:.2f}"
+            elif abs(gap_pct) <= 0.5:
                 status = "ALMOST"
                 status_icon = "🟡"
-                message = f"Very close! Low: ₹{today_low:.2f} vs Entry: ₹{entry_price:.2f} (gap: ₹{gap:.2f})"
+                message = f"Almost! Low ₹{today_low:.2f} vs Entry ₹{entry_price:.2f} (gap: ₹{abs(gap_to_entry):.2f})"
+            elif abs(gap_pct) <= 2.0:
+                status = "CLOSE"
+                status_icon = "🟠"
+                message = f"Close! Low ₹{today_low:.2f} needs ₹{abs(gap_to_entry):.2f} more to reach ₹{entry_price:.2f}"
             else:
                 status = "PENDING"
                 status_icon = "⏳"
-                message = f"Waiting. Low: ₹{today_low:.2f} needs to reach ₹{entry_price:.2f} (gap: ₹{gap:.2f})"
+                message = f"Waiting. Low ₹{today_low:.2f} needs to reach ₹{entry_price:.2f} (gap: ₹{abs(gap_to_entry):.2f})"
     
     return {
         'triggered': triggered,
@@ -661,14 +666,13 @@ def check_entry_triggered(ticker, entry_price, position_type, entry_date=None, c
         'day_low': today_low,
         'current_price': current_price,
         'distance_to_entry': distance_to_entry,
-        'distance_from_low': distance_from_high if position_type == "LONG" else distance_from_low
+        'gap_to_entry': gap_to_entry
     }
 
 
 def check_all_pending_entries(portfolio_df):
     """
     Check trigger status for all positions in portfolio.
-    Returns list of results with trigger status.
     """
     results = []
     
@@ -678,7 +682,6 @@ def check_all_pending_entries(portfolio_df):
         entry_price = float(row['Entry_Price'])
         entry_date = row.get('Entry_Date', None)
         
-        # Check if already marked as triggered in sheet
         existing_status = str(row.get('Triggered', '')).upper().strip()
         
         if existing_status in ['YES', 'TRUE', 'TRIGGERED', 'Y', '1']:
@@ -695,11 +698,10 @@ def check_all_pending_entries(portfolio_df):
                 'day_low': None,
                 'current_price': None,
                 'distance_to_entry': 0,
-                'distance_from_low': 0,
+                'gap_to_entry': 0,
                 'needs_update': False
             })
         else:
-            # Check if entry was triggered
             trigger_result = check_entry_triggered(ticker, entry_price, position_type, entry_date)
             trigger_result['ticker'] = ticker
             trigger_result['entry_price'] = entry_price
@@ -708,7 +710,6 @@ def check_all_pending_entries(portfolio_df):
             results.append(trigger_result)
     
     return results
-
 
 def check_all_pending_entries(portfolio_df):
     """
@@ -3725,16 +3726,21 @@ def display_correlation_analysis(results, enable_correlation):
 # DISPLAY PENDING ENTRIES TAB
 # ============================================================================
 
+# ============================================================================
+# DISPLAY PENDING ENTRIES TAB (CORRECTED UI TEXT)
+# ============================================================================
+
 def display_pending_entries_tab(portfolio_df):
     """
     Display pending entries status in a dedicated tab
     """
     st.subheader("⏳ Entry Trigger Status")
     
+    # ✅ CORRECTED LOGIC DESCRIPTION
     st.markdown("""
     **How it works:**
-    - **LONG:** Entry triggers when Day's Low ≤ Entry Price
-    - **SHORT:** Entry triggers when Day's High ≥ Entry Price
+    - **LONG:** Entry triggers when Day's **High ≥ Entry Price** *(Price goes UP to your buy level)*
+    - **SHORT:** Entry triggers when Day's **Low ≤ Entry Price** *(Price goes DOWN to your short level)*
     """)
     
     # Check all entries
@@ -3744,18 +3750,21 @@ def display_pending_entries_tab(portfolio_df):
     # Separate by status
     triggered = [r for r in trigger_results if r.get('triggered') == True]
     almost = [r for r in trigger_results if r.get('status') == 'ALMOST']
+    close = [r for r in trigger_results if r.get('status') == 'CLOSE']
     pending = [r for r in trigger_results if r.get('status') == 'PENDING']
     errors = [r for r in trigger_results if r.get('status') == 'ERROR']
     
     # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("✅ Triggered", len(triggered))
     with col2:
         st.metric("🟡 Almost", len(almost))
     with col3:
-        st.metric("⏳ Pending", len(pending))
+        st.metric("🟠 Close", len(close))
     with col4:
+        st.metric("⏳ Pending", len(pending))
+    with col5:
         st.metric("📊 Total", len(trigger_results))
     
     st.divider()
@@ -3784,7 +3793,8 @@ def display_pending_entries_tab(portfolio_df):
     for r in trigger_results:
         status_color = {
             'TRIGGERED': '#28a745',
-            'ALMOST': '#ffc107', 
+            'ALMOST': '#ffc107',
+            'CLOSE': '#fd7e14',
             'PENDING': '#6c757d',
             'ERROR': '#dc3545'
         }.get(r.get('status', 'PENDING'), '#6c757d')
@@ -3793,7 +3803,7 @@ def display_pending_entries_tab(portfolio_df):
             f"{r.get('status_icon', '❓')} **{r.get('ticker', 'Unknown')}** | "
             f"{r.get('position_type', '')} @ ₹{r.get('entry_price', 0):,.2f} | "
             f"Status: **{r.get('status', 'Unknown')}**",
-            expanded=(r.get('status') in ['ALMOST', 'ERROR'])
+            expanded=(r.get('status') in ['ALMOST', 'CLOSE', 'ERROR'])
         ):
             col1, col2, col3 = st.columns(3)
             
@@ -3803,13 +3813,6 @@ def display_pending_entries_tab(portfolio_df):
                 st.write(f"**Entry Price:** ₹{r.get('entry_price', 0):,.2f}")
                 if r.get('current_price'):
                     st.write(f"**Current Price:** ₹{r['current_price']:,.2f}")
-                    
-                    # Distance from entry
-                    if r.get('distance_to_entry') is not None:
-                        dist = r['distance_to_entry']
-                        dist_color = "green" if dist > 0 else "red"
-                        st.markdown(f"**From Entry:** <span style='color:{dist_color}'>{dist:+.2f}%</span>", 
-                                   unsafe_allow_html=True)
             
             with col2:
                 st.markdown("##### 📈 Today's Range")
@@ -3817,21 +3820,18 @@ def display_pending_entries_tab(portfolio_df):
                     st.write(f"**High:** ₹{r['day_high']:,.2f}")
                     st.write(f"**Low:** ₹{r['day_low']:,.2f}")
                     
-                    # Gap to entry
+                    # Show gap based on position type
+                    gap = r.get('gap_to_entry', 0)
                     if r.get('position_type') == 'LONG':
-                        gap = r['day_low'] - r['entry_price']
-                        gap_label = "Low vs Entry"
+                        if gap > 0:
+                            st.warning(f"**Gap:** ₹{gap:.2f} below entry")
+                        else:
+                            st.success(f"**Reached:** ₹{abs(gap):.2f} above entry")
                     else:
-                        gap = r['entry_price'] - r['day_high']
-                        gap_label = "Entry vs High"
-                    
-                    gap_color = "green" if gap <= 0 else "orange"
-                    st.markdown(f"**{gap_label}:** <span style='color:{gap_color}'>₹{gap:+,.2f}</span>", 
-                               unsafe_allow_html=True)
-                    
-                    # Percentage gap
-                    gap_pct = (gap / r['entry_price']) * 100
-                    st.caption(f"Gap: {gap_pct:+.3f}%")
+                        if gap > 0:
+                            st.warning(f"**Gap:** ₹{gap:.2f} above entry")
+                        else:
+                            st.success(f"**Reached:** ₹{abs(gap):.2f} below entry")
                 else:
                     st.write("Data not available")
             
@@ -3859,32 +3859,40 @@ def display_pending_entries_tab(portfolio_df):
     
     summary_data = []
     for r in trigger_results:
+        # Determine which price to show based on position type
+        if r.get('position_type') == 'LONG':
+            relevant_price = f"₹{r.get('day_high', 0):,.2f}" if r.get('day_high') else '-'
+            price_label = "Today's High"
+        else:
+            relevant_price = f"₹{r.get('day_low', 0):,.2f}" if r.get('day_low') else '-'
+            price_label = "Today's Low"
+        
         summary_data.append({
             'Status': r.get('status_icon', ''),
             'Ticker': r.get('ticker', ''),
             'Type': r.get('position_type', ''),
             'Entry': f"₹{r.get('entry_price', 0):,.2f}",
-            'Current': f"₹{r.get('current_price', 0):,.2f}" if r.get('current_price') else '-',
-            "Today's Low": f"₹{r.get('day_low', 0):,.2f}" if r.get('day_low') else '-',
-            "Today's High": f"₹{r.get('day_high', 0):,.2f}" if r.get('day_high') else '-',
+            price_label: relevant_price,
+            'Gap': f"₹{r.get('gap_to_entry', 0):,.2f}" if r.get('gap_to_entry') else '-',
             'Trigger Status': r.get('status', ''),
             'Needs Update': '✅ Yes' if r.get('needs_update') else ''
         })
     
     df_summary = pd.DataFrame(summary_data)
     
-    # Color code rows
     def highlight_status(row):
         if row['Trigger Status'] == 'TRIGGERED':
             return ['background-color: #d4edda'] * len(row)
         elif row['Trigger Status'] == 'ALMOST':
             return ['background-color: #fff3cd'] * len(row)
+        elif row['Trigger Status'] == 'CLOSE':
+            return ['background-color: #ffe5d0'] * len(row)
         elif row['Trigger Status'] == 'ERROR':
             return ['background-color: #f8d7da'] * len(row)
         return [''] * len(row)
     
     st.dataframe(df_summary.style.apply(highlight_status, axis=1), 
-                use_container_width=True, hide_index=True)	
+                use_container_width=True, hide_index=True)
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
