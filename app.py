@@ -43,6 +43,10 @@ from email.mime.multipart import MIMEMultipart
 import hashlib
 import time
 import json
+from typing import Tuple, Optional, Dict, List, Any
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Try to import streamlit-autorefresh
 try:
@@ -50,6 +54,29 @@ try:
     HAS_AUTOREFRESH = True
 except ImportError:
     HAS_AUTOREFRESH = False
+
+# ============================================================================
+# SAFE UTILITY FUNCTIONS
+# ============================================================================
+
+def safe_divide(numerator, denominator, default=0.0):
+    """Safe division that handles zero and NaN"""
+    try:
+        if denominator == 0 or pd.isna(denominator) or pd.isna(numerator):
+            return default
+        result = numerator / denominator
+        return default if pd.isna(result) or np.isinf(result) else result
+    except (TypeError, ValueError, ZeroDivisionError, FloatingPointError):
+        return default
+
+def safe_float(value, default=0.0):
+    """Safely convert value to float"""
+    try:
+        result = float(value)
+        return default if pd.isna(result) else result
+    except (TypeError, ValueError, ZeroDivisionError) as e:
+        logging.warning(f"Error in calculation: {e}")
+        return default
 
 # ============================================================================
 # PAGE CONFIG (MUST BE FIRST STREAMLIT COMMAND!)
@@ -231,14 +258,25 @@ def can_send_email(alert_hash, cooldown_minutes=15):
         return True
     
     last_sent = st.session_state.last_email_time[alert_hash]
-    time_diff = (datetime.now() - last_sent).total_seconds() / 60
+    now = get_ist_now()
+    
+    # Handle timezone-aware and naive datetime comparison
+    try:
+        if hasattr(last_sent, 'tzinfo') and last_sent.tzinfo is not None:
+            time_diff = (now - last_sent).total_seconds() / 60
+        else:
+            time_diff = (now.replace(tzinfo=None) - last_sent).total_seconds() / 60
+    except (TypeError, AttributeError):
+        time_diff = cooldown_minutes + 1
+    
     return time_diff >= cooldown_minutes
 
 def mark_email_sent(alert_hash):
     """Mark an alert as sent"""
-    st.session_state.last_email_time[alert_hash] = datetime.now()
+    st.session_state.last_email_time[alert_hash] = get_ist_now()
     st.session_state.email_sent_alerts[alert_hash] = True
 
+MAX_TRADE_HISTORY = 500
 def log_trade(ticker, entry_price, exit_price, quantity, position_type, exit_reason):
     """Log completed trade"""
     if position_type == "LONG":
@@ -262,6 +300,8 @@ def log_trade(ticker, entry_price, exit_price, quantity, position_type, exit_rea
     }
     
     st.session_state.trade_history.append(trade)
+    if len(st.session_state.trade_history) > MAX_TRADE_HISTORY:
+        st.session_state.trade_history = st.session_state.trade_history[-MAX_TRADE_HISTORY:]
     
     # Update stats
     stats = st.session_state.performance_stats
@@ -341,40 +381,77 @@ def rate_limited_api_call(ticker, min_interval=1.0):
 def get_stock_data_safe(ticker, period="6mo"):
     """Safely fetch stock data with rate limiting"""
     symbol = ticker if '.NS' in str(ticker) or '.BO' in str(ticker) else f"{ticker}.NS"
+    max_retries = 3
     
-    rate_limited_api_call(symbol)
-    
-    try:
-        stock = yf.Ticker(symbol)
-        df = stock.history(period=period)
-        
-        if df.empty:
-            symbol = symbol.replace('.NS', '.BO')
+    for attempt in range(max_retries):
+        try:
             rate_limited_api_call(symbol)
             stock = yf.Ticker(symbol)
             df = stock.history(period=period)
-        
-        if df.empty:
-            return None
-        
-        df.reset_index(inplace=True)
-        return df
-    except Exception as e:
-        log_email(f"API Error for {ticker}: {str(e)}")
-        return None
+            
+            if not df.empty:
+                df.reset_index(inplace=True)
+                return df
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1 * (attempt + 1))  # Exponential backoff
+                continue
+            logger.error(f"API Error for {ticker}: {str(e)}")
+            log_email(f"API Error for {ticker}: {str(e)}")
+    
+    return None
 
 def calculate_holding_period(entry_date):
-    """Calculate holding period in days"""
-    if isinstance(entry_date, str):
-        try:
-            entry_date = datetime.strptime(entry_date, "%Y-%m-%d")
-        except:
-            return 0
+    """Calculate holding period in days with multiple format support"""
+    if entry_date is None or entry_date == '' or (isinstance(entry_date, float) and pd.isna(entry_date)):
+        return 0
     
-    now = get_ist_now()
+    if isinstance(entry_date, str):
+        entry_date = entry_date.strip()
+        
+        # Try multiple date formats
+        formats_to_try = [
+            "%Y-%m-%d",
+            "%d-%m-%Y", 
+            "%d/%m/%Y",
+            "%Y/%m/%d",
+            "%d-%b-%Y",
+            "%d %b %Y",
+            "%Y-%m-%d %H:%M:%S",
+            "%d-%m-%Y %H:%M:%S",
+        ]
+        
+        parsed = None
+        for fmt in formats_to_try:
+            try:
+                parsed = datetime.strptime(entry_date, fmt)
+                break
+            except ValueError:
+                continue
+        
+        if parsed is None:
+            log_email(f"Could not parse entry date: {entry_date}")
+            return 0
+        
+        entry_date = parsed
+    
+    # Handle pandas Timestamp
+    if hasattr(entry_date, 'to_pydatetime'):
+        entry_date = entry_date.to_pydatetime()
+    
     if isinstance(entry_date, datetime):
-        delta = now - entry_date
-        return delta.days
+        now = get_ist_now()
+        try:
+            # Handle timezone-aware and naive datetime
+            if entry_date.tzinfo is not None:
+                delta = now - entry_date
+            else:
+                delta = now.replace(tzinfo=None) - entry_date
+            return max(0, delta.days)
+        except (TypeError, ValueError, AttributeError):
+             return 0
+    
     return 0
 
 def get_tax_implication(holding_days, pnl):
@@ -388,20 +465,208 @@ def get_tax_implication(holding_days, pnl):
     else:
         # STCG - 15%
         return "STCG (15%)", "🟡"
+
+# ============================================================================
+# ENTRY TRIGGER CHECK
+# ============================================================================
+
+def check_entry_triggered(ticker, entry_price, position_type, check_period="5d"):
+    """
+    Check if entry price was triggered (hit) during the check period.
+    
+    For LONG: Entry triggers when Low <= Entry Price
+    For SHORT: Entry triggers when High >= Entry Price
+    
+    Returns:
+        dict with trigger status, trigger_date, high, low, current_price
+    """
+    df = get_stock_data_safe(ticker, period=check_period)
+    
+    # Error response template
+    error_response = {
+        'triggered': None,
+        'status': 'ERROR',
+        'status_icon': '❌',
+        'message': 'Could not fetch data',
+        'trigger_date': None,
+        'day_high': None,
+        'day_low': None,
+        'current_price': None,
+        'distance_to_entry': None,
+        'distance_from_low': None
+    }
+    
+    if df is None or df.empty:
+        return error_response
+    
+    try:
+        # Ensure Date column exists
+        if 'Date' not in df.columns:
+            if df.index.name == 'Date':
+                df = df.reset_index()
+            else:
+                df['Date'] = df.index
+        
+        current_price = float(df['Close'].iloc[-1])
+        today_high = float(df['High'].iloc[-1])
+        today_low = float(df['Low'].iloc[-1])
+    except Exception as e:
+        error_response['message'] = f'Data error: {str(e)}'
+        return error_response
+    
+    # Check each day for trigger
+    triggered = False
+    trigger_date = None
+    
+    for idx in range(len(df)):
+        try:
+            day_low = float(df['Low'].iloc[idx])
+            day_high = float(df['High'].iloc[idx])
+            
+            # Get date safely
+            if 'Date' in df.columns:
+                row_date = df['Date'].iloc[idx]
+            else:
+                row_date = df.index[idx]
+            
+            if position_type == "LONG":
+                # For LONG: price should go DOWN to entry level
+                if day_low <= entry_price:
+                    triggered = True
+                    trigger_date = row_date
+                    break
+            else:  # SHORT
+                # For SHORT: price should go UP to entry level
+                if day_high >= entry_price:
+                    triggered = True
+                    trigger_date = row_date
+                    break
+        except (ValueError, TypeError, IndexError, KeyError):
+            continue
+    
+    # Calculate distance to entry
+    if position_type == "LONG":
+        distance_to_entry = ((current_price - entry_price) / entry_price) * 100
+        distance_from_low = ((today_low - entry_price) / entry_price) * 100
+    else:
+        distance_to_entry = ((entry_price - current_price) / entry_price) * 100
+        distance_from_low = ((entry_price - today_high) / entry_price) * 100
+    
+    # Determine status
+    if triggered:
+        status = "TRIGGERED"
+        status_icon = "✅"
+        message = f"Entry triggered on {trigger_date}"
+    else:
+        if position_type == "LONG":
+            if today_low <= entry_price * 1.005:  # Within 0.5%
+                status = "ALMOST"
+                status_icon = "🟡"
+                message = f"Very close! Low: ₹{today_low:.2f} vs Entry: ₹{entry_price:.2f}"
+            else:
+                status = "PENDING"
+                status_icon = "⏳"
+                message = f"Waiting. Low: ₹{today_low:.2f} needs to reach ₹{entry_price:.2f}"
+        else:
+            if today_high >= entry_price * 0.995:  # Within 0.5%
+                status = "ALMOST"
+                status_icon = "🟡"
+                message = f"Very close! High: ₹{today_high:.2f} vs Entry: ₹{entry_price:.2f}"
+            else:
+                status = "PENDING"
+                status_icon = "⏳"
+                message = f"Waiting. High: ₹{today_high:.2f} needs to reach ₹{entry_price:.2f}"
+    
+    return {
+        'triggered': triggered,
+        'status': status,
+        'status_icon': status_icon,
+        'message': message,
+        'trigger_date': trigger_date,
+        'day_high': today_high,
+        'day_low': today_low,
+        'current_price': current_price,
+        'distance_to_entry': distance_to_entry,
+        'distance_from_low': distance_from_low
+    }
+
+def check_all_pending_entries(portfolio_df):
+    """
+    Check trigger status for all positions in portfolio.
+    Returns list of results with trigger status.
+    """
+    results = []
+    
+    for _, row in portfolio_df.iterrows():
+        try:
+            ticker = str(row['Ticker']).strip()
+            position_type = str(row['Position']).upper().strip()
+            entry_price = float(row['Entry_Price'])
+        except Exception as e:
+            continue  # Skip invalid rows
+        
+        # Check if already marked as triggered in sheet (handle missing column)
+        existing_status = ''
+        for col_name in ['Triggered', 'triggered', 'TRIGGERED', 'Entry_Triggered']:
+            if col_name in row.index:
+                val = row.get(col_name, '')
+                if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                    existing_status = str(val).upper().strip()
+                    break
+        
+        if existing_status in ['YES', 'TRUE', 'TRIGGERED', '1', 'Y']:
+            results.append({
+                'ticker': ticker,
+                'entry_price': entry_price,
+                'position_type': position_type,
+                'triggered': True,
+                'status': 'TRIGGERED',
+                'status_icon': '✅',
+                'message': 'Already triggered (from sheet)',
+                'trigger_date': None,
+                'day_high': None,
+                'day_low': None,
+                'current_price': None,
+                'distance_to_entry': None,
+                'distance_from_low': None,
+                'needs_update': False
+            })
+        else:
+            # Check if entry was triggered
+            trigger_result = check_entry_triggered(ticker, entry_price, position_type)
+            trigger_result['ticker'] = ticker
+            trigger_result['entry_price'] = entry_price
+            trigger_result['position_type'] = position_type
+            trigger_result['needs_update'] = trigger_result.get('triggered', False) == True
+            results.append(trigger_result)
+    
+    return results
+
 # ============================================================================
 # TECHNICAL ANALYSIS FUNCTIONS
 # ============================================================================
 
-def calculate_rsi(prices, period=14):
-    """Calculate RSI (Relative Strength Index)"""
+def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+    """Calculate RSI using Wilder's smoothing method"""
     delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    # Use Wilder's smoothing (EWM with alpha = 1/period)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    
+    # Handle division by zero
+    rs = avg_gain / avg_loss.replace(0, np.finfo(float).eps)
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def calculate_macd(prices, fast=12, slow=26, signal=9):
+def calculate_macd(
+    prices: pd.Series, 
+    fast: int = 12, 
+    slow: int = 26, 
+    signal: int = 9
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """Calculate MACD (Moving Average Convergence Divergence)"""
     exp_fast = prices.ewm(span=fast, adjust=False).mean()
     exp_slow = prices.ewm(span=slow, adjust=False).mean()
@@ -411,12 +676,14 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     return macd, signal_line, histogram
 
 def calculate_atr(high, low, close, period=14):
-    """Calculate Average True Range"""
+    """Calculate ATR using Wilder's smoothing"""
     tr1 = high - low
     tr2 = abs(high - close.shift())
     tr3 = abs(low - close.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
+    
+    # Use Wilder's smoothing
+    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     return atr
 
 def calculate_bollinger_bands(prices, period=20, std_dev=2):
@@ -436,24 +703,28 @@ def calculate_sma(prices, period):
     return prices.rolling(window=period).mean()
 
 def calculate_adx(high, low, close, period=14):
-    """Calculate ADX (Average Directional Index)"""
+    """Calculate ADX correctly"""
+    # True Range
     tr1 = high - low
     tr2 = abs(high - close.shift())
     tr3 = abs(low - close.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
     
+    # Directional Movement
     up_move = high - high.shift()
-    down_move = close.shift() - low
+    down_move = low.shift() - low  # ✅ FIXED
     
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
     
-    plus_di = 100 * pd.Series(plus_dm).rolling(window=period).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm).rolling(window=period).mean() / atr
+    # Wilder's smoothing
+    alpha = 1/period
+    atr = tr.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean() / atr
     
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.0001)
-    adx = dx.rolling(window=period).mean()
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+    adx = dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
     
     return adx
 
@@ -462,7 +733,8 @@ def calculate_stochastic(high, low, close, k_period=14, d_period=3):
     lowest_low = low.rolling(window=k_period).min()
     highest_high = high.rolling(window=k_period).max()
     
-    k = 100 * (close - lowest_low) / (highest_high - lowest_low + 0.0001)
+    EPSILON = np.finfo(float).eps
+    k = 100 * (close - lowest_low) / (highest_high - lowest_low + EPSILON)
     d = k.rolling(window=d_period).mean()
     
     return k, d
@@ -793,7 +1065,7 @@ def calculate_momentum_score(df):
     
     # Trend Strength (0-10 points)
     if sma_50 != 0:
-        adx_approx = abs(sma_20 - sma_50) / sma_50 * 100
+        adx_approx = safe_divide(abs(sma_20 - sma_50), sma_50, 0) * 100
     else:
         adx_approx = 0
     
@@ -2070,7 +2342,7 @@ def smart_analyze_position(ticker, position_type, entry_price, quantity, stop_lo
         risk = stop_loss - entry_price
         reward = entry_price - target1
     
-    risk_reward_ratio = reward / risk if risk > 0 else 0
+    risk_reward_ratio = safe_divide(reward, risk, default=0.0)
     
     return {
         # Basic Info
@@ -2245,6 +2517,78 @@ def load_portfolio():
             'Entry_Date': ['2024-01-15', '2024-01-20', '2024-02-01', '2024-01-10', '2024-02-05'],
             'Status': ['ACTIVE', 'ACTIVE', 'ACTIVE', 'ACTIVE', 'ACTIVE']
         })
+
+# ============================================================================
+# PORTFOLIO VALIDATION
+# ============================================================================
+
+def validate_portfolio(df):
+    """
+    Validate portfolio data and return errors
+    Returns: (is_valid, errors_list)
+    """
+    errors = []
+    warnings = []
+    
+    # Check required columns
+    required_cols = ['Ticker', 'Position', 'Entry_Price', 'Stop_Loss', 'Target_1']
+    for col in required_cols:
+        if col not in df.columns:
+            errors.append(f"❌ Missing required column: {col}")
+    
+    if errors:
+        return False, errors, warnings
+    
+    # Validate each row
+    for idx, row in df.iterrows():
+        ticker = str(row.get('Ticker', f'Row {idx}')).strip()
+        
+        try:
+            entry = float(row['Entry_Price'])
+            sl = float(row['Stop_Loss'])
+            target = float(row['Target_1'])
+            position = str(row['Position']).upper().strip()
+        except (ValueError, TypeError) as e:
+            errors.append(f"❌ {ticker}: Invalid number format - {e}")
+            continue
+        
+        # Check positive values
+        if entry <= 0:
+            errors.append(f"❌ {ticker}: Entry price must be positive")
+        if sl <= 0:
+            errors.append(f"❌ {ticker}: Stop loss must be positive")
+        if target <= 0:
+            errors.append(f"❌ {ticker}: Target must be positive")
+        
+        # Check position type
+        if position not in ['LONG', 'SHORT']:
+            errors.append(f"❌ {ticker}: Position must be 'LONG' or 'SHORT', got '{position}'")
+            continue
+        
+        # Validate levels based on position type
+        if position == 'LONG':
+            if entry <= sl:
+                errors.append(f"❌ {ticker} (LONG): Entry (₹{entry}) must be > Stop Loss (₹{sl})")
+            if target <= entry:
+                warnings.append(f"⚠️ {ticker} (LONG): Target (₹{target}) should be > Entry (₹{entry})")
+        else:  # SHORT
+            if entry >= sl:
+                errors.append(f"❌ {ticker} (SHORT): Entry (₹{entry}) must be < Stop Loss (₹{sl})")
+            if target >= entry:
+                warnings.append(f"⚠️ {ticker} (SHORT): Target (₹{target}) should be < Entry (₹{entry})")
+        
+        # Check quantity if present
+        if 'Quantity' in df.columns:
+            try:
+                qty = int(row['Quantity'])
+                if qty <= 0:
+                    errors.append(f"❌ {ticker}: Quantity must be positive")
+            except:
+                warnings.append(f"⚠️ {ticker}: Invalid quantity, using default (1)")
+    
+    is_valid = len(errors) == 0
+    return is_valid, errors, warnings
+
 
 # ============================================================================
 # EMAIL ALERT FUNCTIONS
@@ -2861,6 +3205,43 @@ def render_sidebar():
         st.divider()
         
         # =====================================================================
+        # RESET STATS
+        # =====================================================================
+        st.markdown("### 🔄 Reset Data")
+        
+        with st.expander("Reset Options", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("🗑️ Reset Stats", use_container_width=True, key="reset_stats"):
+                    st.session_state.performance_stats = {
+                        'total_trades': 0,
+                        'wins': 0,
+                        'losses': 0,
+                        'total_profit': 0,
+                        'total_loss': 0
+                    }
+                    st.session_state.trade_history = []
+                    st.session_state.max_drawdown = 0
+                    st.session_state.current_drawdown = 0
+                    st.session_state.peak_portfolio_value = 0
+                    st.success("✅ Stats reset!")
+                    time.sleep(1)
+                    st.rerun()
+            
+            with col2:
+                if st.button("🗑️ Clear Cache", use_container_width=True, key="clear_cache"):
+                    st.cache_data.clear()
+                    st.success("✅ Cache cleared!")
+                    time.sleep(1)
+                    st.rerun()
+            
+            if st.button("🗑️ Reset Email Log", use_container_width=True, key="reset_email"):
+                st.session_state.email_log = []
+                st.session_state.email_sent_alerts = {}
+                st.session_state.last_email_time = {}
+                st.success("✅ Email log reset!")
+        # =====================================================================
         # DEBUG INFO
         # =====================================================================
         with st.expander("🔧 Debug Info"):
@@ -2877,10 +3258,21 @@ def render_sidebar():
                 st.write(f"Email cooldown: {email_settings['cooldown']} min")
             
             # Email log
+                        # Email log
             if st.session_state.email_log:
                 st.markdown("**Recent Email Log:**")
                 for log_entry in st.session_state.email_log[-5:]:
                     st.caption(log_entry)
+                
+                # Download button for full log
+                full_log = "\n".join(st.session_state.email_log)
+                st.download_button(
+                    "📥 Download Full Log",
+                    full_log,
+                    file_name=f"email_log_{get_ist_now().strftime('%Y%m%d_%H%M')}.txt",
+                    mime="text/plain",
+                    key="download_email_log"
+                )
         
         # Return all settings
         return {
@@ -3208,7 +3600,171 @@ def display_correlation_analysis(results, enable_correlation):
                 st.success("✅ No highly correlated pairs found")
     else:
         st.error(f"Could not calculate correlations: {status}")
-		
+
+# ============================================================================
+# DISPLAY PENDING ENTRIES TAB
+# ============================================================================
+
+def display_pending_entries_tab(portfolio_df):
+    """
+    Display pending entries status in a dedicated tab
+    """
+    st.subheader("⏳ Entry Trigger Status")
+    
+    st.markdown("""
+    **How it works:**
+    - **LONG:** Entry triggers when Day's Low ≤ Entry Price
+    - **SHORT:** Entry triggers when Day's High ≥ Entry Price
+    """)
+    
+    # Check all entries
+    with st.spinner("Checking entry triggers..."):
+        trigger_results = check_all_pending_entries(portfolio_df)
+    
+    # Separate by status
+    triggered = [r for r in trigger_results if r.get('triggered') == True]
+    almost = [r for r in trigger_results if r.get('status') == 'ALMOST']
+    pending = [r for r in trigger_results if r.get('status') == 'PENDING']
+    errors = [r for r in trigger_results if r.get('status') == 'ERROR']
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("✅ Triggered", len(triggered))
+    with col2:
+        st.metric("🟡 Almost", len(almost))
+    with col3:
+        st.metric("⏳ Pending", len(pending))
+    with col4:
+        st.metric("📊 Total", len(trigger_results))
+    
+    st.divider()
+    
+    # Entries needing update
+    needs_update = [r for r in trigger_results if r.get('needs_update')]
+    if needs_update:
+        st.error(f"🔔 **{len(needs_update)} entries just triggered!** Update your Google Sheet.")
+        
+        update_data = []
+        for r in needs_update:
+            update_data.append({
+                'Ticker': r['ticker'],
+                'Position': r['position_type'],
+                'Entry Price': f"₹{r['entry_price']:,.2f}",
+                'Trigger Date': str(r.get('trigger_date', 'Today')),
+                'Action': 'Set Triggered = YES'
+            })
+        
+        st.dataframe(pd.DataFrame(update_data), use_container_width=True, hide_index=True)
+        st.divider()
+    
+    # Display all entries
+    st.markdown("### 📋 All Entries Status")
+    
+    for r in trigger_results:
+        status_color = {
+            'TRIGGERED': '#28a745',
+            'ALMOST': '#ffc107', 
+            'PENDING': '#6c757d',
+            'ERROR': '#dc3545'
+        }.get(r.get('status', 'PENDING'), '#6c757d')
+        
+        with st.expander(
+            f"{r.get('status_icon', '❓')} **{r.get('ticker', 'Unknown')}** | "
+            f"{r.get('position_type', '')} @ ₹{r.get('entry_price', 0):,.2f} | "
+            f"Status: **{r.get('status', 'Unknown')}**",
+            expanded=(r.get('status') in ['ALMOST', 'ERROR'])
+        ):
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown("##### 📊 Entry Details")
+                st.write(f"**Position:** {r.get('position_type', 'N/A')}")
+                st.write(f"**Entry Price:** ₹{r.get('entry_price', 0):,.2f}")
+                if r.get('current_price'):
+                    st.write(f"**Current Price:** ₹{r['current_price']:,.2f}")
+                    
+                    # Distance from entry
+                    if r.get('distance_to_entry') is not None:
+                        dist = r['distance_to_entry']
+                        dist_color = "green" if dist > 0 else "red"
+                        st.markdown(f"**From Entry:** <span style='color:{dist_color}'>{dist:+.2f}%</span>", 
+                                   unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown("##### 📈 Today's Range")
+                if r.get('day_high') and r.get('day_low'):
+                    st.write(f"**High:** ₹{r['day_high']:,.2f}")
+                    st.write(f"**Low:** ₹{r['day_low']:,.2f}")
+                    
+                    # Gap to entry
+                    if r.get('position_type') == 'LONG':
+                        gap = r['day_low'] - r['entry_price']
+                        gap_label = "Low vs Entry"
+                    else:
+                        gap = r['entry_price'] - r['day_high']
+                        gap_label = "Entry vs High"
+                    
+                    gap_color = "green" if gap <= 0 else "orange"
+                    st.markdown(f"**{gap_label}:** <span style='color:{gap_color}'>₹{gap:+,.2f}</span>", 
+                               unsafe_allow_html=True)
+                    
+                    # Percentage gap
+                    gap_pct = (gap / r['entry_price']) * 100
+                    st.caption(f"Gap: {gap_pct:+.3f}%")
+                else:
+                    st.write("Data not available")
+            
+            with col3:
+                st.markdown("##### 📌 Status")
+                st.markdown(f"""
+                <div style='padding:15px;background:{status_color}20;border-radius:10px;
+                            border-left:4px solid {status_color};text-align:center;'>
+                    <h2 style='margin:0;color:{status_color};'>{r.get('status_icon', '')} {r.get('status', '')}</h2>
+                </div>
+                """, unsafe_allow_html=True)
+                st.caption(r.get('message', ''))
+            
+            # Show trigger date if triggered
+            if r.get('triggered') and r.get('trigger_date'):
+                st.success(f"✅ **Triggered on:** {r['trigger_date']}")
+            
+            # Show update reminder if needed
+            if r.get('needs_update'):
+                st.warning("📝 **Action Required:** Update Google Sheet - Set `Triggered = YES`")
+    
+    # Summary table
+    st.divider()
+    st.markdown("### 📊 Summary Table")
+    
+    summary_data = []
+    for r in trigger_results:
+        summary_data.append({
+            'Status': r.get('status_icon', ''),
+            'Ticker': r.get('ticker', ''),
+            'Type': r.get('position_type', ''),
+            'Entry': f"₹{r.get('entry_price', 0):,.2f}",
+            'Current': f"₹{r.get('current_price', 0):,.2f}" if r.get('current_price') else '-',
+            "Today's Low": f"₹{r.get('day_low', 0):,.2f}" if r.get('day_low') else '-',
+            "Today's High": f"₹{r.get('day_high', 0):,.2f}" if r.get('day_high') else '-',
+            'Trigger Status': r.get('status', ''),
+            'Needs Update': '✅ Yes' if r.get('needs_update') else ''
+        })
+    
+    df_summary = pd.DataFrame(summary_data)
+    
+    # Color code rows
+    def highlight_status(row):
+        if row['Trigger Status'] == 'TRIGGERED':
+            return ['background-color: #d4edda'] * len(row)
+        elif row['Trigger Status'] == 'ALMOST':
+            return ['background-color: #fff3cd'] * len(row)
+        elif row['Trigger Status'] == 'ERROR':
+            return ['background-color: #f8d7da'] * len(row)
+        return [''] * len(row)
+    
+    st.dataframe(df_summary.style.apply(highlight_status, axis=1), 
+                use_container_width=True, hide_index=True)	
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
@@ -3258,10 +3814,41 @@ def main():
     st.divider()
     
     # Load Portfolio
+        # Load Portfolio
     portfolio = load_portfolio()
     
     if portfolio is None or len(portfolio) == 0:
         st.warning("⚠️ No positions found!")
+        
+        # Show sample format
+        st.markdown("### 📋 Expected Google Sheets Format:")
+        sample_df = pd.DataFrame({
+            'Ticker': ['RELIANCE', 'TCS', 'INFY'],
+            'Position': ['LONG', 'LONG', 'SHORT'],
+            'Entry_Price': [2450.00, 3580.00, 1520.00],
+            'Quantity': [10, 5, 8],
+            'Stop_Loss': [2380.00, 3480.00, 1580.00],
+            'Target_1': [2550.00, 3720.00, 1420.00],
+            'Target_2': [2650.00, 3850.00, 1350.00],
+            'Entry_Date': ['2024-01-15', '2024-01-20', '2024-02-01'],
+            'Status': ['ACTIVE', 'ACTIVE', 'ACTIVE']
+        })
+        st.dataframe(sample_df, use_container_width=True)
+        return
+    
+    # Validate Portfolio Data
+    is_valid, errors, warnings = validate_portfolio(portfolio)
+    
+    if errors:
+        st.error("❌ Portfolio Validation Failed!")
+        for error in errors:
+            st.error(error)
+        st.stop()
+    
+    if warnings:
+        with st.expander("⚠️ Validation Warnings", expanded=False):
+            for warning in warnings:
+                st.warning(warning)
         
         # Show sample format
         st.markdown("### 📋 Expected Google Sheets Format:")
@@ -3375,13 +3962,14 @@ def main():
     # =========================================================================
     # MAIN TABS
     # =========================================================================
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Dashboard",
         "📈 Charts", 
         "🔔 Alerts",
         "📉 MTF Analysis",
         "🛡️ Portfolio Risk",
         "📈 Performance",
+        "⏳ Entry Status",
         "📋 Details"
     ])
     
@@ -3460,6 +4048,26 @@ def main():
                     st.write(f"**ATR:** ₹{r['atr']:,.2f}")
                     st.write(f"**Dist to S:** {r['distance_to_support']:.1f}%")
                     st.write(f"**Dist to R:** {r['distance_to_resistance']:.1f}%")
+                
+                st.divider()
+
+                                # Check entry trigger status
+                trigger_check = check_entry_triggered(r['ticker'], r['entry_price'], r['position_type'], "1d")
+                
+                if trigger_check['status'] == 'PENDING':
+                    st.warning(f"""
+                    ⏳ **ENTRY NOT TRIGGERED YET**
+                    - Your Entry: ₹{r['entry_price']:,.2f}
+                    - Today's {'Low' if r['position_type'] == 'LONG' else 'High'}: ₹{trigger_check['day_low'] if r['position_type'] == 'LONG' else trigger_check['day_high']:,.2f}
+                    - Gap: ₹{abs((trigger_check['day_low'] if r['position_type'] == 'LONG' else trigger_check['day_high']) - r['entry_price']):,.2f}
+                    """)
+                elif trigger_check['status'] == 'ALMOST':
+                    st.info(f"""
+                    🟡 **ALMOST TRIGGERED!**
+                    - Your Entry: ₹{r['entry_price']:,.2f}
+                    - Today's {'Low' if r['position_type'] == 'LONG' else 'High'}: ₹{trigger_check['day_low'] if r['position_type'] == 'LONG' else trigger_check['day_high']:,.2f}
+                    - Gap: ₹{abs((trigger_check['day_low'] if r['position_type'] == 'LONG' else trigger_check['day_high']) - r['entry_price']):,.2f}
+                    """)
                 
                 st.divider()
                 
@@ -3775,11 +4383,15 @@ def main():
     # =========================================================================
     with tab6:
         display_performance_dashboard()
-    
-    # =========================================================================
-    # TAB 7: DETAILS
+        # =========================================================================
+    # TAB 7: ENTRY STATUS (NEW)
     # =========================================================================
     with tab7:
+        display_pending_entries_tab(portfolio)
+    # =========================================================================
+    # TAB 8: DETAILS
+    # =========================================================================
+    with tab8:
         st.subheader("📋 Complete Analysis Data")
         
         details_data = []
