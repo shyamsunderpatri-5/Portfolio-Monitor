@@ -214,6 +214,475 @@ def is_market_hours():
     else:
         return True, "OPEN", f"Closes at 15:30 IST", "🟢"
 
+# ============================================================================
+# GAP 1: MARKET HEALTH CHECK (NIFTY + VIX)
+# ============================================================================
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_market_health():
+    """
+    Analyze NIFTY 50 and India VIX to determine overall market health
+    Returns: dict with status, message, color, action, metrics
+    """
+    try:
+        # Get NIFTY 50 data
+        nifty = yf.Ticker("^NSEI")
+        nifty_df = nifty.history(period="1mo")
+        
+        if nifty_df.empty:
+            return None
+        
+        nifty_price = float(nifty_df['Close'].iloc[-1])
+        nifty_prev = float(nifty_df['Close'].iloc[-2]) if len(nifty_df) > 1 else nifty_price
+        nifty_change = ((nifty_price - nifty_prev) / nifty_prev) * 100
+        
+        # Calculate NIFTY indicators
+        nifty_sma20 = nifty_df['Close'].rolling(20).mean().iloc[-1]
+        nifty_sma50 = nifty_df['Close'].rolling(50).mean().iloc[-1] if len(nifty_df) >= 50 else nifty_sma20
+        nifty_rsi = calculate_rsi(nifty_df['Close']).iloc[-1]
+        
+        if pd.isna(nifty_rsi):
+            nifty_rsi = 50
+        
+        # Get India VIX (Volatility Index)
+        vix = yf.Ticker("^INDIAVIX")
+        vix_df = vix.history(period="5d")
+        vix_value = float(vix_df['Close'].iloc[-1]) if not vix_df.empty else 15
+        
+        # Calculate Market Health Score (0-100)
+        health_score = 50  # Start neutral
+        
+        # NIFTY Price vs SMA20 (0-20 points)
+        if nifty_price > nifty_sma20:
+            health_score += 15
+        else:
+            health_score -= 15
+        
+        # NIFTY Price vs SMA50 (0-15 points)
+        if nifty_price > nifty_sma50:
+            health_score += 10
+        else:
+            health_score -= 10
+        
+        # NIFTY RSI (0-20 points)
+        if nifty_rsi > 55:
+            health_score += 15
+        elif nifty_rsi > 45:
+            health_score += 5
+        elif nifty_rsi < 35:
+            health_score -= 15
+        elif nifty_rsi < 45:
+            health_score -= 10
+        
+        # VIX Level (0-25 points)
+        if vix_value < 12:
+            health_score += 20  # Very low volatility = good
+        elif vix_value < 15:
+            health_score += 10
+        elif vix_value > 25:
+            health_score -= 20  # High volatility = bad
+        elif vix_value > 18:
+            health_score -= 10
+        
+        # NIFTY Trend (SMA20 vs SMA50) (0-20 points)
+        if nifty_sma20 > nifty_sma50:
+            health_score += 10  # Golden cross
+        else:
+            health_score -= 10  # Death cross
+        
+        # Cap between 0-100
+        health_score = max(0, min(100, health_score))
+        
+        # Determine Status
+        if health_score >= 70:
+            status = "BULLISH"
+            color = "#28a745"
+            icon = "🟢"
+            action = "✅ Good environment for trading"
+            sl_adjustment = "NORMAL"
+        elif health_score >= 50:
+            status = "NEUTRAL"
+            color = "#ffc107"
+            icon = "🟡"
+            action = "⚠️ Be selective with new positions"
+            sl_adjustment = "NORMAL"
+        elif health_score >= 30:
+            status = "WEAK"
+            color = "#fd7e14"
+            icon = "🟠"
+            action = "⚠️ Tighten stop losses, avoid new longs"
+            sl_adjustment = "TIGHTEN"
+        else:
+            status = "BEARISH"
+            color = "#dc3545"
+            icon = "🔴"
+            action = "🚨 HIGH RISK - Consider reducing exposure"
+            sl_adjustment = "AGGRESSIVE"
+        
+        # Build message
+        message = f"NIFTY: ₹{nifty_price:,.0f} ({nifty_change:+.2f}%) | RSI: {nifty_rsi:.0f} | VIX: {vix_value:.1f}"
+        
+        return {
+            'status': status,
+            'health_score': health_score,
+            'message': message,
+            'color': color,
+            'icon': icon,
+            'action': action,
+            'sl_adjustment': sl_adjustment,
+            'nifty_price': nifty_price,
+            'nifty_change': nifty_change,
+            'nifty_rsi': nifty_rsi,
+            'nifty_sma20': nifty_sma20,
+            'nifty_sma50': nifty_sma50,
+            'vix': vix_value,
+            'above_sma20': nifty_price > nifty_sma20,
+            'above_sma50': nifty_price > nifty_sma50
+        }
+    
+    except Exception as e:
+        logger.error(f"Market health check failed: {e}")
+        return None
+# ============================================================================
+# GAP 2: EMERGENCY EXIT DETECTOR
+# ============================================================================
+
+def detect_emergency_exit(result, market_health):
+    """
+    Detect critical exit conditions that override normal analysis
+    Returns: (is_emergency, reasons, urgency_level)
+    """
+    emergency = False
+    reasons = []
+    urgency = "NORMAL"
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # EMERGENCY CONDITION 1: Market Crash + Losing Position
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if market_health and market_health['status'] in ['BEARISH', 'WEAK']:
+        if result['pnl_percent'] < -2:
+            emergency = True
+            urgency = "CRITICAL"
+            reasons.append(f"🚨 Market {market_health['status']} + Position down {result['pnl_percent']:.1f}%")
+        elif result['pnl_percent'] < 0:
+            urgency = "HIGH"
+            reasons.append(f"⚠️ Weak market + Position negative ({result['pnl_percent']:.1f}%)")
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # EMERGENCY CONDITION 2: Gap Down Below SL
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if result['position_type'] == 'LONG':
+        if result['day_low'] < result['stop_loss'] * 0.98:
+            emergency = True
+            urgency = "CRITICAL"
+            reasons.append(f"🚨 Gap down: Day low ₹{result['day_low']:.2f} below SL ₹{result['stop_loss']:.2f}")
+    else:  # SHORT
+        if result['day_high'] > result['stop_loss'] * 1.02:
+            emergency = True
+            urgency = "CRITICAL"
+            reasons.append(f"🚨 Gap up: Day high ₹{result['day_high']:.2f} above SL ₹{result['stop_loss']:.2f}")
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # EMERGENCY CONDITION 3: VIX Spike + High SL Risk
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if market_health and market_health['vix'] > 25:
+        if result['sl_risk'] > 60:
+            emergency = True
+            urgency = "CRITICAL"
+            reasons.append(f"🚨 VIX spike ({market_health['vix']:.1f}) + SL Risk {result['sl_risk']}%")
+        elif result['sl_risk'] > 50:
+            urgency = "HIGH"
+            reasons.append(f"⚠️ High VIX ({market_health['vix']:.1f}) + SL Risk {result['sl_risk']}%")
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # EMERGENCY CONDITION 4: Heavy Selling Volume + Negative
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if result['position_type'] == 'LONG':
+        if result['volume_signal'] in ['STRONG_SELLING', 'SELLING']:
+            if result['volume_ratio'] > 2.5 and result['pnl_percent'] < -1:
+                emergency = True
+                urgency = "HIGH"
+                reasons.append(f"⚠️ Heavy selling volume ({result['volume_ratio']:.1f}x) + Position down")
+    else:  # SHORT
+        if result['volume_signal'] in ['STRONG_BUYING', 'BUYING']:
+            if result['volume_ratio'] > 2.5 and result['pnl_percent'] < -1:
+                emergency = True
+                urgency = "HIGH"
+                reasons.append(f"⚠️ Heavy buying volume ({result['volume_ratio']:.1f}x) + Position down")
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # EMERGENCY CONDITION 5: All Timeframes Against Position
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if result['mtf_alignment'] < 20 and result['sl_risk'] > 50:
+        emergency = True
+        urgency = "HIGH"
+        reasons.append(f"⚠️ All timeframes against position (MTF: {result['mtf_alignment']}%)")
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # EMERGENCY CONDITION 6: Breakdown Below Support with Volume
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if result['position_type'] == 'LONG':
+        if result['current_price'] < result['support'] * 0.99:
+            if result['volume_ratio'] > 1.5:
+                emergency = True
+                urgency = "HIGH"
+                reasons.append(f"⚠️ Breakdown below support ₹{result['support']:.2f} with volume")
+    else:  # SHORT
+        if result['current_price'] > result['resistance'] * 1.01:
+            if result['volume_ratio'] > 1.5:
+                emergency = True
+                urgency = "HIGH"
+                reasons.append(f"⚠️ Breakout above resistance ₹{result['resistance']:.2f} with volume")
+    
+    return emergency, reasons, urgency    
+
+# ============================================================================
+# GAP 3: STOCK-SPECIFIC WIN RATE ANALYSIS
+# ============================================================================
+
+def get_stock_performance_history(ticker):
+    """
+    Analyze historical performance for specific stock
+    Returns: dict with win_rate, trade_count, avg_win, avg_loss, recommendation
+    """
+    # Get trades for this ticker
+    stock_trades = [t for t in st.session_state.trade_history if t['ticker'] == ticker]
+    
+    if len(stock_trades) < 3:
+        return {
+            'has_history': False,
+            'trade_count': len(stock_trades),
+            'message': f"Only {len(stock_trades)} trade(s) logged - need 3+ for analysis"
+        }
+    
+    # Calculate statistics
+    total_trades = len(stock_trades)
+    wins = sum(1 for t in stock_trades if t['win'])
+    losses = total_trades - wins
+    win_rate = (wins / total_trades) * 100
+    
+    winning_trades = [t for t in stock_trades if t['win']]
+    losing_trades = [t for t in stock_trades if not t['win']]
+    
+    avg_win = sum(t['pnl'] for t in winning_trades) / max(wins, 1)
+    avg_loss = sum(abs(t['pnl']) for t in losing_trades) / max(losses, 1)
+    
+    # Calculate expectancy
+    expectancy = (win_rate/100 * avg_win) - ((100-win_rate)/100 * avg_loss)
+    
+    # Profit factor
+    total_profit = sum(t['pnl'] for t in winning_trades)
+    total_loss = sum(abs(t['pnl']) for t in losing_trades)
+    profit_factor = total_profit / max(total_loss, 1)
+    
+    # Determine recommendation
+    if win_rate < 30:
+        quality = "POOR"
+        color = "#dc3545"
+        icon = "🔴"
+        recommendation = "⚠️ AVOID - Very low win rate"
+    elif win_rate < 40:
+        quality = "WEAK"
+        color = "#fd7e14"
+        icon = "🟠"
+        recommendation = "⚠️ CAUTION - Below average performance"
+    elif win_rate < 50:
+        quality = "AVERAGE"
+        color = "#ffc107"
+        icon = "🟡"
+        recommendation = "ℹ️ Acceptable - Monitor closely"
+    elif win_rate < 60:
+        quality = "GOOD"
+        color = "#28a745"
+        icon = "🟢"
+        recommendation = "✅ Good track record"
+    else:
+        quality = "EXCELLENT"
+        color = "#20c997"
+        icon = "💚"
+        recommendation = "✅ Excellent performance!"
+    
+    # Check expectancy
+    if expectancy < 0:
+        recommendation = "🚨 NEGATIVE EXPECTANCY - Stop trading this stock!"
+        quality = "LOSING"
+        color = "#dc3545"
+    
+    return {
+        'has_history': True,
+        'trade_count': total_trades,
+        'wins': wins,
+        'losses': losses,
+        'win_rate': win_rate,
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'expectancy': expectancy,
+        'profit_factor': profit_factor,
+        'quality': quality,
+        'color': color,
+        'icon': icon,
+        'recommendation': recommendation
+    }
+
+# ============================================================================
+# GAP 4: CHART PATTERN DETECTION
+# ============================================================================
+
+def detect_chart_patterns(df, current_price):
+    """
+    Detect common chart patterns
+    Returns: list of detected patterns with signals
+    """
+    patterns = []
+    
+    if len(df) < 30:
+        return patterns
+    
+    close = df['Close']
+    high = df['High']
+    low = df['Low']
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PATTERN 1: DOUBLE TOP (Bearish)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    last_30 = df.tail(30)
+    highs_30 = last_30['High']
+    
+    # Find two highest peaks
+    sorted_highs = highs_30.nlargest(5)
+    if len(sorted_highs) >= 2:
+        peak1 = sorted_highs.iloc[0]
+        peak2 = sorted_highs.iloc[1]
+        
+        # Check if peaks are similar (within 2%)
+        if abs(peak1 - peak2) / peak1 < 0.02:
+            # Check if current price is below peaks
+            if current_price < peak1 * 0.98:
+                patterns.append({
+                    'name': 'DOUBLE TOP',
+                    'signal': 'BEARISH',
+                    'strength': 'HIGH',
+                    'icon': '📉',
+                    'description': f'Resistance at ₹{peak1:.2f} tested twice',
+                    'action': 'Watch for breakdown - potential reversal'
+                })
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PATTERN 2: DOUBLE BOTTOM (Bullish)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    lows_30 = last_30['Low']
+    sorted_lows = lows_30.nsmallest(5)
+    
+    if len(sorted_lows) >= 2:
+        bottom1 = sorted_lows.iloc[0]
+        bottom2 = sorted_lows.iloc[1]
+        
+        if abs(bottom1 - bottom2) / bottom1 < 0.02:
+            if current_price > bottom1 * 1.02:
+                patterns.append({
+                    'name': 'DOUBLE BOTTOM',
+                    'signal': 'BULLISH',
+                    'strength': 'HIGH',
+                    'icon': '📈',
+                    'description': f'Support at ₹{bottom1:.2f} held twice',
+                    'action': 'Watch for breakout - potential reversal'
+                })
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PATTERN 3: BULLISH ENGULFING (Bullish)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if len(df) >= 2:
+        prev_candle = df.iloc[-2]
+        curr_candle = df.iloc[-1]
+        
+        # Previous red, current green, and current engulfs previous
+        if (prev_candle['Close'] < prev_candle['Open'] and
+            curr_candle['Close'] > curr_candle['Open'] and
+            curr_candle['Open'] < prev_candle['Close'] and
+            curr_candle['Close'] > prev_candle['Open']):
+            
+            patterns.append({
+                'name': 'BULLISH ENGULFING',
+                'signal': 'BULLISH',
+                'strength': 'MEDIUM',
+                'icon': '🟢',
+                'description': 'Strong reversal candle pattern',
+                'action': 'Potential upward momentum'
+            })
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PATTERN 4: BEARISH ENGULFING (Bearish)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if len(df) >= 2:
+        prev_candle = df.iloc[-2]
+        curr_candle = df.iloc[-1]
+        
+        if (prev_candle['Close'] > prev_candle['Open'] and
+            curr_candle['Close'] < curr_candle['Open'] and
+            curr_candle['Open'] > prev_candle['Close'] and
+            curr_candle['Close'] < prev_candle['Open']):
+            
+            patterns.append({
+                'name': 'BEARISH ENGULFING',
+                'signal': 'BEARISH',
+                'strength': 'MEDIUM',
+                'icon': '🔴',
+                'description': 'Strong reversal candle pattern',
+                'action': 'Potential downward momentum'
+            })
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PATTERN 5: ASCENDING TRIANGLE (Bullish)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if len(df) >= 20:
+        last_20 = df.tail(20)
+        
+        # Check if highs are flat (resistance)
+        highs_20 = last_20['High']
+        high_max = highs_20.max()
+        high_std = highs_20.std()
+        
+        # Check if lows are rising
+        lows_20 = last_20['Low']
+        low_trend = lows_20.iloc[-5:].mean() > lows_20.iloc[:5].mean()
+        
+        if high_std / high_max < 0.015 and low_trend:  # Flat top + rising lows
+            patterns.append({
+                'name': 'ASCENDING TRIANGLE',
+                'signal': 'BULLISH',
+                'strength': 'HIGH',
+                'icon': '📐',
+                'description': f'Breakout potential above ₹{high_max:.2f}',
+                'action': 'Watch for volume spike on breakout'
+            })
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PATTERN 6: DESCENDING TRIANGLE (Bearish)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if len(df) >= 20:
+        last_20 = df.tail(20)
+        
+        # Check if lows are flat (support)
+        lows_20 = last_20['Low']
+        low_min = lows_20.min()
+        low_std = lows_20.std()
+        
+        # Check if highs are falling
+        highs_20 = last_20['High']
+        high_trend = highs_20.iloc[-5:].mean() < highs_20.iloc[:5].mean()
+        
+        if low_std / low_min < 0.015 and high_trend:  # Flat bottom + falling highs
+            patterns.append({
+                'name': 'DESCENDING TRIANGLE',
+                'signal': 'BEARISH',
+                'strength': 'HIGH',
+                'icon': '📐',
+                'description': f'Breakdown potential below ₹{low_min:.2f}',
+                'action': 'Watch for volume spike on breakdown'
+            })
+    
+    return patterns
+
 def send_email_alert(subject, html_content, sender, password, recipient):
     """
     Send email alert - Returns (success, message)
@@ -251,7 +720,7 @@ def send_email_alert(subject, html_content, sender, password, recipient):
         log_email(f"❌ Email failed: {str(e)}")
         return False, f"Email failed: {str(e)}"
     
-    
+
 def log_email(message):
     """Add to email log"""
     timestamp = get_ist_now().strftime("%H:%M:%S")
@@ -3489,20 +3958,88 @@ def main():
     is_open, market_status, market_msg, market_icon = is_market_hours()
     ist_now = get_ist_now()
     
-    # Header row
+    # =========================================================================
+    # HEADER ROW (Market Status + Time + Refresh Button)
+    # =========================================================================
     col1, col2, col3 = st.columns([2, 2, 1])
+    
     with col1:
         st.markdown(f"### {market_icon} {market_status}")
         st.caption(market_msg)
+    
     with col2:
         st.markdown(f"### 🕐 {ist_now.strftime('%H:%M:%S')} IST")
         st.caption(ist_now.strftime('%A, %B %d, %Y'))
+    
     with col3:
         if st.button("🔄 Refresh", use_container_width=True, type="primary"):
             st.cache_data.clear()
             st.rerun()
     
-    # Show settings summary
+    # =========================================================================
+    # ✅ GAP 1: MARKET HEALTH DISPLAY (OUTSIDE COLUMNS - FULL WIDTH!)
+    # =========================================================================
+    st.divider()
+    
+    market_health = get_market_health()
+    
+    if market_health:
+        st.markdown(f"""
+        <div style='background:{market_health['color']}20; padding:20px; border-radius:12px; 
+                    border-left:5px solid {market_health['color']}; margin:15px 0;'>
+            <div style='display:flex; justify-content:space-between; align-items:center;'>
+                <div>
+                    <h2 style='margin:0; color:{market_health['color']};'>
+                        {market_health['icon']} Market Health: {market_health['status']}
+                    </h2>
+                    <p style='margin:8px 0; font-size:1.1em;'>{market_health['message']}</p>
+                    <p style='margin:8px 0; font-weight:bold; font-size:1.05em;'>{market_health['action']}</p>
+                </div>
+                <div style='text-align:center; min-width:100px;'>
+                    <h1 style='margin:0; color:{market_health['color']};'>{market_health['health_score']}</h1>
+                    <p style='margin:0; font-size:0.9em;'>Health Score</p>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Show detailed metrics in expander
+        with st.expander("📊 Market Details", expanded=False):
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            
+            with m_col1:
+                st.metric("NIFTY 50", f"₹{market_health['nifty_price']:,.0f}", 
+                         f"{market_health['nifty_change']:+.2f}%")
+            
+            with m_col2:
+                st.metric("RSI", f"{market_health['nifty_rsi']:.1f}")
+            
+            with m_col3:
+                st.metric("India VIX", f"{market_health['vix']:.1f}")
+            
+            with m_col4:
+                st.metric("Trend", "Bullish" if market_health['above_sma20'] else "Bearish")
+            
+            # Technical levels
+            st.caption(f"NIFTY SMA20: ₹{market_health['nifty_sma20']:,.0f} | SMA50: ₹{market_health['nifty_sma50']:,.0f}")
+        
+        # ✅ AUTO-ADJUST SL THRESHOLDS BASED ON MARKET
+        if market_health['sl_adjustment'] == 'AGGRESSIVE':
+            settings['sl_risk_threshold'] = max(30, settings['sl_risk_threshold'] - 20)
+            st.warning(f"⚠️ SL Risk threshold auto-adjusted to {settings['sl_risk_threshold']}% due to weak market")
+        elif market_health['sl_adjustment'] == 'TIGHTEN':
+            settings['sl_risk_threshold'] = max(35, settings['sl_risk_threshold'] - 10)
+            st.info(f"ℹ️ SL Risk threshold adjusted to {settings['sl_risk_threshold']}% (cautious mode)")
+    
+    else:
+        market_health = None  # Set to None if fetch failed
+        st.warning("⚠️ Unable to fetch market health data")
+    
+    st.divider()
+    
+    # =========================================================================
+    # SETTINGS SUMMARY
+    # =========================================================================
     with st.expander("⚙️ Current Settings", expanded=False):
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
@@ -3701,6 +4238,57 @@ def main():
                 f"Action: **{r['overall_action'].replace('_', ' ')}**",
                 expanded=(r['overall_status'] in ['CRITICAL', 'WARNING', 'OPPORTUNITY', 'SUCCESS'])
             ):
+                # ✅ GAP 2: CHECK FOR EMERGENCY EXIT
+                is_emergency, emergency_reasons, urgency_level = detect_emergency_exit(r, market_health)
+                
+                if is_emergency:
+                    if urgency_level == "CRITICAL":
+                        st.markdown("""
+                        <div style='background:#dc3545; color:white; padding:15px; border-radius:10px; 
+                                    text-align:center; font-size:1.2em; font-weight:bold; margin-bottom:15px;
+                                    animation: blink 1s infinite;'>
+                            🚨 EMERGENCY EXIT REQUIRED 🚨
+                        </div>
+                        <style>
+                        @keyframes blink {
+                            0%, 50%, 100% { opacity: 1; }
+                            25%, 75% { opacity: 0.5; }
+                        }
+                        </style>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.error("⚠️ HIGH URGENCY - Consider immediate exit")
+                    
+                    st.markdown("**Emergency Conditions:**")
+                    for reason in emergency_reasons:
+                        st.error(f"• {reason}")
+                    
+                    st.divider()
+                # ✅ GAP 3: STOCK WIN RATE WARNING
+                stock_history = get_stock_performance_history(r['ticker'])
+                
+                if stock_history['has_history']:
+                    if stock_history['win_rate'] < 45 or stock_history['expectancy'] < 0:
+                        st.markdown(f"""
+                        <div style='background:{stock_history['color']}20; padding:12px; border-radius:8px; 
+                                    border-left:4px solid {stock_history['color']}; margin-bottom:15px;'>
+                            <strong>{stock_history['icon']} Historical Performance: {stock_history['quality']}</strong><br>
+                            Win Rate: {stock_history['win_rate']:.1f}% ({stock_history['wins']}/{stock_history['trade_count']}) | 
+                            Expectancy: ₹{stock_history['expectancy']:+,.0f}<br>
+                            <strong>{stock_history['recommendation']}</strong>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        with st.expander(f"{stock_history['icon']} Historical: {stock_history['quality']} ({stock_history['win_rate']:.0f}% win rate)", expanded=False):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Win Rate", f"{stock_history['win_rate']:.1f}%")
+                            with col2:
+                                st.metric("Trades", f"{stock_history['wins']}/{stock_history['trade_count']}")
+                            with col3:
+                                st.metric("Expectancy", f"₹{stock_history['expectancy']:+,.0f}")
+                
+                st.divider()
                 # Row 1: Basic Info
                 col1, col2, col3, col4 = st.columns(4)
                 
@@ -3806,6 +4394,25 @@ def main():
                         st.markdown("<h2 style='color:#6c757d;text-align:center;'>N/A</h2>",
                                    unsafe_allow_html=True)
                         st.caption("MTF data unavailable")
+                                    # ✅ GAP 4: CHART PATTERN DETECTION
+                if 'df' in r:
+                    detected_patterns = detect_chart_patterns(r['df'], r['current_price'])
+                    
+                    if detected_patterns:
+                        st.divider()
+                        st.markdown("##### 📐 Detected Patterns")
+                        
+                        for pattern in detected_patterns:
+                            signal_color = "#28a745" if pattern['signal'] == 'BULLISH' else "#dc3545"
+                            
+                            st.markdown(f"""
+                            <div style='background:{signal_color}20; padding:10px; border-radius:8px; 
+                                        border-left:3px solid {signal_color}; margin:5px 0;'>
+                                <strong>{pattern['icon']} {pattern['name']}</strong> ({pattern['signal']} - {pattern['strength']})<br>
+                                <small>{pattern['description']}</small><br>
+                                <em>→ {pattern['action']}</em>
+                            </div>
+                            """, unsafe_allow_html=True)
                 
                 # Row 3: Partial Exits
                 if r['partial_exits']['triggered_count'] > 0:
